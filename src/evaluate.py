@@ -95,7 +95,7 @@ def evaluate_on_set(
 def evaluate_gcr(
     model: torch.nn.Module,
     cfg,
-    preprocessor: Preprocessor,
+    input_pre: Preprocessor,
     energy_grid: np.ndarray,
 ) -> dict[str, float]:
     """Evaluate model on the GCR spectrum.
@@ -107,7 +107,7 @@ def evaluate_gcr(
     ----------
     model        : trained UNet1D
     cfg          : OmegaConf config
-    preprocessor : Preprocessor
+    input_pre    : Preprocessor for the network input (detector A)
     energy_grid  : (N,) canonical keV grid
 
     Returns
@@ -126,8 +126,8 @@ def evaluate_gcr(
     sic_resampled = resample_to_canonical(gcr_energy, gcr_sic, energy_grid)
     tepc_resampled = resample_to_canonical(gcr_energy, gcr_tepc, energy_grid)
 
-    # Preprocess input
-    sic_t, total = preprocessor.transform(sic_resampled)
+    # Preprocess input (detector A) the same way as during training
+    sic_t, _ = input_pre.transform(sic_resampled)
     x = torch.from_numpy(sic_t).unsqueeze(0).unsqueeze(0)  # (1, 1, N)
 
     device = next(model.parameters()).device
@@ -135,11 +135,10 @@ def evaluate_gcr(
     with torch.no_grad():
         pred_t = model(x.to(device)).cpu().squeeze().numpy()  # (N,)
 
-    # Inverse transform for physical comparison
-    pred_phys = preprocessor.inverse_transform(pred_t, total_counts=tepc_resampled.sum())
-    # Normalize both for fair comparison
+    # The softmax head already outputs a normalized density -- do NOT apply any
+    # log-inverse here. Just renormalize both to densities for a fair compare.
     tepc_norm = tepc_resampled / (tepc_resampled.sum() + 1e-30)
-    pred_norm = pred_phys / (pred_phys.sum() + 1e-30)
+    pred_norm = pred_t / (pred_t.sum() + 1e-30)
 
     pred_tensor = torch.from_numpy(pred_norm.astype(np.float32)).unsqueeze(0)
     target_tensor = torch.from_numpy(tepc_norm.astype(np.float32)).unsqueeze(0)

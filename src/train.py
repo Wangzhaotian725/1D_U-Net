@@ -19,7 +19,7 @@ from src.data import load_spectrum_file
 from src.dataset import FixedMixtureSet, SyntheticMixtureDataset
 from src.losses import SpectrumLoss
 from src.model import UNet1D
-from src.preprocessing import Preprocessor
+from src.preprocessing import Preprocessor, build_preprocessors
 from src.synth import SynthGenerator
 
 
@@ -146,21 +146,22 @@ def train(cfg, fast_dev_run: bool = False) -> None:
         energy_grid, mono_A, mono_B, energies_MeV, heldout, cfg
     )
 
-    preprocessor = Preprocessor(
-        normalize=cfg.preprocessing.normalize_to_density,
-        log_compress=cfg.preprocessing.log_compress,
-        log_scale=cfg.preprocessing.log_scale,
-    )
+    input_pre, target_pre = build_preprocessors(cfg)
 
     samples_per_epoch = 2 if fast_dev_run else cfg.train.samples_per_epoch
     val_n = 4 if fast_dev_run else cfg.train.val_mixtures
     test_n = 4 if fast_dev_run else cfg.train.test_mixtures
 
     train_ds = SyntheticMixtureDataset(
-        train_gen, preprocessor, samples_per_epoch=samples_per_epoch, base_seed=cfg.seed
+        train_gen, input_pre, target_pre,
+        samples_per_epoch=samples_per_epoch, base_seed=cfg.seed,
     )
-    val_ds = FixedMixtureSet(val_gen, preprocessor, n_samples=val_n, seed=cfg.seed + 1)
-    test_ds = FixedMixtureSet(val_gen, preprocessor, n_samples=test_n, seed=cfg.seed + 2)
+    val_ds = FixedMixtureSet(
+        val_gen, input_pre, target_pre, n_samples=val_n, seed=cfg.seed + 1
+    )
+    test_ds = FixedMixtureSet(
+        val_gen, input_pre, target_pre, n_samples=test_n, seed=cfg.seed + 2
+    )
 
     batch_size = min(cfg.train.batch_size, samples_per_epoch)
     train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True, num_workers=0)

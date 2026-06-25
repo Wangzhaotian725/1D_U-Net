@@ -16,7 +16,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 from src.evaluate import evaluate_gcr
 from src.model import UNet1D
 from src.plots import plot_cdf_comparison, plot_spectrum_comparison
-from src.preprocessing import Preprocessor
+from src.preprocessing import Preprocessor, build_preprocessors
 
 
 def main() -> None:
@@ -45,13 +45,9 @@ def main() -> None:
     model.load_state_dict(ckpt["model"])
     model.eval()
 
-    preprocessor = Preprocessor(
-        normalize=cfg.preprocessing.normalize_to_density,
-        log_compress=cfg.preprocessing.log_compress,
-        log_scale=cfg.preprocessing.log_scale,
-    )
+    input_pre, _ = build_preprocessors(cfg)
 
-    results = evaluate_gcr(model, cfg, preprocessor, energy_grid)
+    results = evaluate_gcr(model, cfg, input_pre, energy_grid)
 
     # Separate arrays from scalar metrics
     arrays = {k: v for k, v in results.items() if k.startswith("_")}

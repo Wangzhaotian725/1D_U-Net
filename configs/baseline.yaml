@@ -7,7 +7,8 @@ data:
   heldout_energies_MeV: [600, 2000, 7000]
 preprocessing:
   normalize_to_density: true
-  log_compress: true
+  log_compress: true        # applies to the network INPUT only; the target stays
+                            # a plain normalized density to match the softmax head
   log_scale: 1.0e4
 synth:
   weight_prior: dirichlet
