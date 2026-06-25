@@ -1,8 +1,37 @@
 """Loss functions for spectrum regression."""
 from __future__ import annotations
 
+import numpy as np
 import torch
 import torch.nn as nn
+
+
+def make_bin_dist(energy_grid: np.ndarray, emd_space: str) -> "torch.Tensor | None":
+    """Build per-bin distance weights for EMD.
+
+    Parameters
+    ----------
+    energy_grid : (N,) energy axis in keV
+    emd_space   : 'index' | 'log_energy' | 'linear_energy'
+
+    Returns
+    -------
+    torch.Tensor of shape (N,) or None for index space
+    """
+    if emd_space == "index":
+        return None
+    elif emd_space == "log_energy":
+        log_e = np.log10(energy_grid.astype(np.float64))
+        # delta between adjacent bins; pad last with same as second-to-last
+        deltas = np.diff(log_e)
+        deltas = np.append(deltas, deltas[-1])
+        return torch.tensor(deltas, dtype=torch.float32)
+    elif emd_space == "linear_energy":
+        deltas = np.diff(energy_grid.astype(np.float64))
+        deltas = np.append(deltas, deltas[-1])
+        return torch.tensor(deltas, dtype=torch.float32)
+    else:
+        raise ValueError(f"Unknown emd_space: {emd_space!r}")
 
 
 def emd_1d(

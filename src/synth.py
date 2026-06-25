@@ -34,31 +34,39 @@ def sample_weights(
     n_energies: int,
     family: str,
     rng: np.random.Generator,
-    gcr_powerlaw_index: float = -2.7,
     energies_MeV: np.ndarray | None = None,
+    dirichlet_alpha_choices: list[float] | None = None,
+    sparse_k_range: tuple[int, int] = (2, 4),
 ) -> np.ndarray:
     """Sample mixture weights for a given family.
 
     Parameters
     ----------
-    n_energies        : number of energy bins (K)
-    family            : 'mono' | 'sparse' | 'dense' | 'gcr_like'
-    rng               : numpy Generator
-    gcr_powerlaw_index: exponent for power-law weights
-    energies_MeV      : (K,) energy values (required for 'gcr_like')
+    n_energies              : number of energy bins (K)
+    family                  : 'mono' | 'sparse' | 'sparse_k' | 'dense' |
+                              'dirichlet_uniform' | 'loguniform'
+    rng                     : numpy Generator
+    energies_MeV            : (K,) energy values in MeV (unused by most families)
+    dirichlet_alpha_choices : alpha values to pick from for 'dirichlet_uniform'
+    sparse_k_range          : (min, max) active energies for 'sparse_k'
 
     Returns
     -------
     (K,) non-negative weights (not necessarily normalized)
     """
+    if dirichlet_alpha_choices is None:
+        dirichlet_alpha_choices = [0.3, 1.0, 3.0]
+
     if family == "mono":
         w = np.zeros(n_energies)
         idx = rng.integers(0, n_energies)
         w[idx] = 1.0
         return w
 
-    elif family == "sparse":
-        n_active = rng.integers(2, 5)  # 2-4 active
+    elif family in ("sparse", "sparse_k"):
+        # 'sparse' is kept as alias for backward compatibility
+        lo, hi = sparse_k_range
+        n_active = rng.integers(lo, hi + 1)  # inclusive hi
         n_active = min(n_active, n_energies)
         indices = rng.choice(n_energies, size=n_active, replace=False)
         raw = rng.uniform(0.1, 1.0, size=n_active)
@@ -71,17 +79,18 @@ def sample_weights(
         w = rng.dirichlet(np.ones(n_energies))
         return w
 
-    elif family == "gcr_like":
-        if energies_MeV is None:
-            # Fall back to indices as proxy for energy
-            e = np.arange(1, n_energies + 1, dtype=np.float64)
-        else:
-            e = np.asarray(energies_MeV, dtype=np.float64)
-        w = e ** gcr_powerlaw_index
-        # Add some random noise to avoid identical samples
-        noise = rng.uniform(0.5, 1.5, size=n_energies)
-        w = w * noise
-        w = np.clip(w, 0.0, None)
+    elif family == "dirichlet_uniform":
+        alpha = float(rng.choice(dirichlet_alpha_choices))
+        w = rng.dirichlet(np.full(n_energies, alpha))
+        return w
+
+    elif family == "loguniform":
+        log_lo = np.log(1e-3)
+        log_hi = np.log(1.0)
+        log_w = rng.uniform(log_lo, log_hi, size=n_energies)
+        w = np.exp(log_w)
+        # normalize
+        w = w / w.sum()
         return w
 
     else:
@@ -93,12 +102,14 @@ class SynthGenerator:
 
     Parameters
     ----------
-    mono_A            : (K, N) monoenergetic A spectra (pre-normalized)
-    mono_B            : (K, N) monoenergetic B spectra (pre-normalized)
-    energies_MeV      : (K,) energy values in MeV
-    families          : list of family names to randomly select from
-    poisson_noise     : whether to add Poisson noise to the mixture
-    gcr_powerlaw_index: exponent for 'gcr_like' family
+    mono_A                  : (K, N) monoenergetic A spectra (pre-normalized)
+    mono_B                  : (K, N) monoenergetic B spectra (pre-normalized)
+    energies_MeV            : (K,) energy values in MeV
+    families                : list of family names to randomly select from
+    poisson_noise           : whether to add Poisson noise to the mixture
+    poisson_counts_range    : (min, max) total counts for Poisson sampling
+    dirichlet_alpha_choices : alpha values for 'dirichlet_uniform' family
+    sparse_k_range          : (min, max) active bins for 'sparse_k' family
     """
 
     def __init__(
@@ -108,14 +119,18 @@ class SynthGenerator:
         energies_MeV: np.ndarray,
         families: list[str],
         poisson_noise: bool = True,
-        gcr_powerlaw_index: float = -2.7,
+        poisson_counts_range: tuple[int, int] = (1000, 100000),
+        dirichlet_alpha_choices: list[float] | None = None,
+        sparse_k_range: tuple[int, int] = (2, 4),
     ) -> None:
         self.mono_A = np.asarray(mono_A, dtype=np.float64)
         self.mono_B = np.asarray(mono_B, dtype=np.float64)
         self.energies_MeV = np.asarray(energies_MeV, dtype=np.float64)
         self.families = list(families)
         self.poisson_noise = poisson_noise
-        self.gcr_powerlaw_index = gcr_powerlaw_index
+        self.poisson_counts_range = poisson_counts_range
+        self.dirichlet_alpha_choices = dirichlet_alpha_choices if dirichlet_alpha_choices is not None else [0.3, 1.0, 3.0]
+        self.sparse_k_range = sparse_k_range
         self.n_energies = len(energies_MeV)
 
     def sample(self, rng: np.random.Generator) -> tuple[np.ndarray, np.ndarray]:
@@ -130,15 +145,17 @@ class SynthGenerator:
             self.n_energies,
             family,
             rng,
-            gcr_powerlaw_index=self.gcr_powerlaw_index,
             energies_MeV=self.energies_MeV,
+            dirichlet_alpha_choices=self.dirichlet_alpha_choices,
+            sparse_k_range=self.sparse_k_range,
         )
 
         A_mix, B_mix = make_synthetic_pair(self.mono_A, self.mono_B, weights)
 
         if self.poisson_noise:
             # Simulate Poisson noise at a random count level
-            n_counts = int(rng.uniform(1e3, 1e5))
+            lo, hi = self.poisson_counts_range
+            n_counts = int(rng.uniform(lo, hi))
             if A_mix.sum() > 0:
                 A_counts = rng.poisson(A_mix * n_counts / A_mix.sum())
                 A_mix = A_counts.astype(np.float64)

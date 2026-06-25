@@ -17,7 +17,7 @@ from torch.utils.tensorboard import SummaryWriter
 
 from src.data import load_spectrum_file
 from src.dataset import FixedMixtureSet, SyntheticMixtureDataset
-from src.losses import SpectrumLoss
+from src.losses import SpectrumLoss, make_bin_dist
 from src.model import UNet1D
 from src.preprocessing import Preprocessor, build_preprocessors
 from src.synth import SynthGenerator
@@ -98,13 +98,21 @@ def build_generators(
 
     families = list(cfg.synth.mixture_families)
 
+    dirichlet_alpha_choices = list(cfg.synth.get("dirichlet_alpha_choices", [0.3, 1.0, 3.0]))
+    sparse_k_range_cfg = cfg.synth.get("sparse_k_range", [2, 4])
+    sparse_k_range = tuple(sparse_k_range_cfg)
+    poisson_counts_range_cfg = cfg.synth.get("poisson_counts_range", [1000, 100000])
+    poisson_counts_range = tuple(poisson_counts_range_cfg)
+
     train_gen = SynthGenerator(
         mono_A[train_idx],
         mono_B[train_idx],
         np.array([energies_MeV[i] for i in train_idx]),
         families=families,
         poisson_noise=cfg.synth.poisson_noise,
-        gcr_powerlaw_index=cfg.synth.gcr_powerlaw_index,
+        dirichlet_alpha_choices=dirichlet_alpha_choices,
+        sparse_k_range=sparse_k_range,
+        poisson_counts_range=poisson_counts_range,
     )
 
     if held_idx:
@@ -114,7 +122,9 @@ def build_generators(
             np.array([energies_MeV[i] for i in held_idx]),
             families=families,
             poisson_noise=cfg.synth.poisson_noise,
-            gcr_powerlaw_index=cfg.synth.gcr_powerlaw_index,
+            dirichlet_alpha_choices=dirichlet_alpha_choices,
+            sparse_k_range=sparse_k_range,
+            poisson_counts_range=poisson_counts_range,
         )
     else:
         # Fall back to training energies if no heldout available
@@ -179,8 +189,12 @@ def train(cfg, fast_dev_run: bool = False) -> None:
     n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(f"Model parameters: {n_params:,}")
 
+    # Build bin_dist for EMD
+    emd_space = cfg.loss.get("emd_space", "index")
+    bin_dist = make_bin_dist(energy_grid, emd_space)
+
     # Loss
-    criterion = SpectrumLoss(w_mse=cfg.loss.w_mse, w_emd=cfg.loss.w_emd)
+    criterion = SpectrumLoss(w_mse=cfg.loss.w_mse, w_emd=cfg.loss.w_emd, bin_dist=bin_dist)
 
     # Optimizer
     optimizer = torch.optim.AdamW(
@@ -206,6 +220,11 @@ def train(cfg, fast_dev_run: bool = False) -> None:
     OmegaConf.save(cfg, str(run_dir / "config.yaml"))
 
     best_val_loss = float("inf")
+    best_val_emd = float("inf")
+
+    early_stop_metric = cfg.train.get("early_stop_metric", "val_emd")
+    early_stop_patience = cfg.train.get("early_stop_patience", 50)
+    patience_counter = 0
 
     for epoch in range(epochs):
         # Training
@@ -241,26 +260,31 @@ def train(cfg, fast_dev_run: bool = False) -> None:
         # Validation
         model.eval()
         val_losses = []
+        val_emds = []
         with torch.no_grad():
             for batch in val_loader:
                 x = batch["input"].to(device)
                 y = batch["target"].to(device)
                 with torch.amp.autocast("cuda", enabled=use_amp):
                     pred = model(x)
-                    loss, _ = criterion(pred, y)
+                    loss, loss_dict = criterion(pred, y)
                 val_losses.append(loss.item())
+                val_emds.append(loss_dict["emd"].item())
 
         avg_val = np.mean(val_losses)
+        avg_val_emd = np.mean(val_emds)
         lr = scheduler.get_last_lr()[0]
 
         writer.add_scalar("Loss/train", avg_train, epoch)
         writer.add_scalar("Loss/val", avg_val, epoch)
+        writer.add_scalar("EMD/val", avg_val_emd, epoch)
         writer.add_scalar("LR", lr, epoch)
 
         if (epoch + 1) % 10 == 0 or epoch == 0:
             print(
                 f"Epoch {epoch+1:4d}/{epochs} | "
-                f"train={avg_train:.4f} val={avg_val:.4f} lr={lr:.2e}"
+                f"train={avg_train:.4f} val={avg_val:.4f} "
+                f"val_emd={avg_val_emd:.4f} lr={lr:.2e}"
             )
 
         # Checkpoint
@@ -269,6 +293,7 @@ def train(cfg, fast_dev_run: bool = False) -> None:
             "model": model.state_dict(),
             "optimizer": optimizer.state_dict(),
             "val_loss": avg_val,
+            "val_emd": avg_val_emd,
             "cfg": OmegaConf.to_container(cfg),
         }
         torch.save(state, str(ckpt_dir / "last.pt"))
@@ -277,8 +302,21 @@ def train(cfg, fast_dev_run: bool = False) -> None:
             best_val_loss = avg_val
             torch.save(state, str(ckpt_dir / "best.pt"))
 
+        # Early stopping on val_emd
+        if avg_val_emd < best_val_emd:
+            best_val_emd = avg_val_emd
+            patience_counter = 0
+        else:
+            patience_counter += 1
+            if not fast_dev_run and patience_counter >= early_stop_patience:
+                print(
+                    f"Early stopping at epoch {epoch+1}: "
+                    f"val_emd={avg_val_emd:.4f} (patience={early_stop_patience})"
+                )
+                break
+
     writer.close()
-    print(f"Training done. Best val loss: {best_val_loss:.4f}")
+    print(f"Training done. Best val loss: {best_val_loss:.4f}, best val EMD: {best_val_emd:.4f}")
     print(f"Checkpoints: {ckpt_dir}/best.pt, {ckpt_dir}/last.pt")
     print(f"TensorBoard logs: {run_dir}")
 
