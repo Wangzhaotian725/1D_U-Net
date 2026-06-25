@@ -103,6 +103,8 @@ def build_generators(
     sparse_k_range = tuple(sparse_k_range_cfg)
     poisson_counts_range_cfg = cfg.synth.get("poisson_counts_range", [1000, 100000])
     poisson_counts_range = tuple(poisson_counts_range_cfg)
+    powerlaw_alpha_range_cfg = cfg.synth.get("powerlaw_alpha_range", [-3.0, 0.0])
+    powerlaw_alpha_range = tuple(powerlaw_alpha_range_cfg)
 
     train_gen = SynthGenerator(
         mono_A[train_idx],
@@ -113,6 +115,7 @@ def build_generators(
         dirichlet_alpha_choices=dirichlet_alpha_choices,
         sparse_k_range=sparse_k_range,
         poisson_counts_range=poisson_counts_range,
+        powerlaw_alpha_range=powerlaw_alpha_range,
     )
 
     if held_idx:
@@ -125,6 +128,7 @@ def build_generators(
             dirichlet_alpha_choices=dirichlet_alpha_choices,
             sparse_k_range=sparse_k_range,
             poisson_counts_range=poisson_counts_range,
+            powerlaw_alpha_range=powerlaw_alpha_range,
         )
     else:
         # Fall back to training energies if no heldout available

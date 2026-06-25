@@ -37,6 +37,7 @@ def sample_weights(
     energies_MeV: np.ndarray | None = None,
     dirichlet_alpha_choices: list[float] | None = None,
     sparse_k_range: tuple[int, int] = (2, 4),
+    powerlaw_alpha_range: tuple[float, float] = (-3.0, 0.0),
 ) -> np.ndarray:
     """Sample mixture weights for a given family.
 
@@ -44,11 +45,12 @@ def sample_weights(
     ----------
     n_energies              : number of energy bins (K)
     family                  : 'mono' | 'sparse' | 'sparse_k' | 'dense' |
-                              'dirichlet_uniform' | 'loguniform'
+                              'dirichlet_uniform' | 'loguniform' | 'powerlaw_neutral'
     rng                     : numpy Generator
-    energies_MeV            : (K,) energy values in MeV (unused by most families)
+    energies_MeV            : (K,) energy values in MeV; required for 'powerlaw_neutral'
     dirichlet_alpha_choices : alpha values to pick from for 'dirichlet_uniform'
     sparse_k_range          : (min, max) active energies for 'sparse_k'
+    powerlaw_alpha_range    : (min, max) exponent range for 'powerlaw_neutral'
 
     Returns
     -------
@@ -89,7 +91,14 @@ def sample_weights(
         log_hi = np.log(1.0)
         log_w = rng.uniform(log_lo, log_hi, size=n_energies)
         w = np.exp(log_w)
-        # normalize
+        w = w / w.sum()
+        return w
+
+    elif family == "powerlaw_neutral":
+        if energies_MeV is None:
+            raise ValueError("energies_MeV required for 'powerlaw_neutral' family")
+        alpha = rng.uniform(*powerlaw_alpha_range)
+        w = np.asarray(energies_MeV, dtype=np.float64) ** alpha
         w = w / w.sum()
         return w
 
@@ -110,6 +119,7 @@ class SynthGenerator:
     poisson_counts_range    : (min, max) total counts for Poisson sampling
     dirichlet_alpha_choices : alpha values for 'dirichlet_uniform' family
     sparse_k_range          : (min, max) active bins for 'sparse_k' family
+    powerlaw_alpha_range    : (min, max) exponent for 'powerlaw_neutral' family
     """
 
     def __init__(
@@ -122,6 +132,7 @@ class SynthGenerator:
         poisson_counts_range: tuple[int, int] = (1000, 100000),
         dirichlet_alpha_choices: list[float] | None = None,
         sparse_k_range: tuple[int, int] = (2, 4),
+        powerlaw_alpha_range: tuple[float, float] = (-3.0, 0.0),
     ) -> None:
         self.mono_A = np.asarray(mono_A, dtype=np.float64)
         self.mono_B = np.asarray(mono_B, dtype=np.float64)
@@ -131,6 +142,7 @@ class SynthGenerator:
         self.poisson_counts_range = poisson_counts_range
         self.dirichlet_alpha_choices = dirichlet_alpha_choices if dirichlet_alpha_choices is not None else [0.3, 1.0, 3.0]
         self.sparse_k_range = sparse_k_range
+        self.powerlaw_alpha_range = tuple(powerlaw_alpha_range)
         self.n_energies = len(energies_MeV)
 
     def sample(self, rng: np.random.Generator) -> tuple[np.ndarray, np.ndarray]:
@@ -148,6 +160,7 @@ class SynthGenerator:
             energies_MeV=self.energies_MeV,
             dirichlet_alpha_choices=self.dirichlet_alpha_choices,
             sparse_k_range=self.sparse_k_range,
+            powerlaw_alpha_range=self.powerlaw_alpha_range,
         )
 
         A_mix, B_mix = make_synthetic_pair(self.mono_A, self.mono_B, weights)

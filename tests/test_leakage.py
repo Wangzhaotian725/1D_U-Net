@@ -69,9 +69,10 @@ def test_synth_neutral():
     assert not hasattr(gen, "gcr_powerlaw_index"), \
         "SynthGenerator should not have gcr_powerlaw_index attribute"
 
-    # All four neutral families work
-    for family in ("mono", "sparse_k", "dirichlet_uniform", "loguniform"):
-        w = sample_weights(n, family, rng)
+    # All five neutral families work
+    energies = np.linspace(100.0, 10000.0, n)
+    for family in ("mono", "sparse_k", "dirichlet_uniform", "loguniform", "powerlaw_neutral"):
+        w = sample_weights(n, family, rng, energies_MeV=energies)
         assert w.shape == (n,), f"Family {family!r} returned wrong shape"
         assert (w >= 0).all(), f"Family {family!r} returned negative weights"
         assert w.sum() > 0, f"Family {family!r} returned all-zero weights"
