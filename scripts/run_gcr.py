@@ -34,7 +34,7 @@ def main() -> None:
     energy_grid = np.load("data/processed/energy_grid.npy")
 
     # Load model
-    ckpt = torch.load(args.ckpt, map_location="cpu")
+    ckpt = torch.load(args.ckpt, map_location="cpu", weights_only=False)
     model = UNet1D(
         in_ch=cfg.model.in_ch,
         out_ch=1,
