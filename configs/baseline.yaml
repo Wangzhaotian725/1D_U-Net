@@ -1,0 +1,42 @@
+seed: 42
+data:
+  raw_glob: "data/raw/*MeV.xlsx"
+  gcr_file: "data/deploy/GCR_spectrum.xlsx"
+  sheet_skiprows: 1
+  direction: "SiC_SBD->TEPC"
+  heldout_energies_MeV: [600, 2000, 7000]
+preprocessing:
+  normalize_to_density: true
+  log_compress: true
+  log_scale: 1.0e4
+synth:
+  weight_prior: dirichlet
+  gcr_powerlaw_index: -2.7
+  mixture_families: [mono, sparse, dense, gcr_like]
+  poisson_noise: true
+model:
+  arch: unet1d
+  in_ch: 1
+  base_channels: 32
+  depth: 3
+  norm: group
+  activation: gelu
+  head: softmax
+loss:
+  w_mse: 1.0
+  w_emd: 1.0
+  emd_space: index
+train:
+  samples_per_epoch: 1024
+  val_mixtures: 256
+  test_mixtures: 256
+  epochs: 300
+  batch_size: 64
+  optimizer: adamw
+  lr: 3.0e-4
+  weight_decay: 1.0e-4
+  scheduler: cosine
+  grad_clip: 1.0
+  amp: true
+eval:
+  tail_percentile: 90
