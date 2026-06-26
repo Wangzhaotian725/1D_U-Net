@@ -1,0 +1,66 @@
+seed: 42
+data:
+  raw_glob: "data/raw/*MeV.xlsx"
+  gcr_file: "data/deploy/GCR_spectrum.xlsx"   # deployment spectrum; origin unknown
+  sheet_skiprows: 1
+  direction: "SiC_SBD->TEPC"
+  # 13 energies: 90/100/200/300/400/500/600/800/1000/2000/4000/7000/10000 MeV.
+  # Heldout frozen from v0.4 and carried forward unchanged.
+  heldout_energies_MeV: [100, 600, 2000, 7000]
+
+preprocessing:
+  normalize_to_density: true
+  log_compress: true
+  log_scale: 1.0e4
+
+synth:
+  # All five neutral families; none templated on the deployment spectrum.
+  mixture_families: [mono, sparse_k, dirichlet_uniform, loguniform, powerlaw_neutral]
+  powerlaw_alpha_range: [-3.0, 0.0]   # generic random exponent, NOT a physical index
+  dirichlet_alpha_choices: [0.1, 0.3, 1.0, 3.0]
+  sparse_k_range: [2, 8]
+  poisson_noise: true
+  poisson_counts_range: [1000, 100000]
+
+model:
+  arch: unet1d
+  in_ch: 1
+  base_channels: 32      # small model: avoids v0.3 overfitting
+  depth: 3
+  norm: group
+  activation: gelu
+  head: softplus_renorm  # normalized head: reverts v0.4 non-normalized head
+
+loss:
+  w_emd: 2.0
+  w_peak: 2.0            # explicit peak-alignment loss (v0.5 first priority)
+  peak_window_half: 30   # ±30 bins window around target peak for soft centroid
+  w_mse: 0.5
+  region_kev: [0.1, 1000.0]   # focus MSE on the main spectral body
+  region_in_weight: 1.0
+  region_out_weight: 0.1       # high-energy tail (>1000 keV) gets 10x less MSE weight
+  emd_space: index       # index EMD gives better peak alignment than log_energy
+
+train:
+  samples_per_epoch: 2048
+  val_mixtures: 256
+  test_mixtures: 256
+  epochs: 600
+  # selection_score = peak_err + lambda_region * region_emd
+  # Peak position is the primary criterion; no deployment-spectrum info is used.
+  early_stop_metric: selection_score
+  lambda_region: 0.3
+  early_stop_patience: 80
+  batch_size: 64
+  optimizer: adamw
+  lr: 2.0e-4
+  weight_decay: 1.0e-4
+  scheduler: cosine
+  grad_clip: 1.0
+  amp: true
+
+eval:
+  tail_percentile: 90
+  wide_families: [dirichlet_uniform, loguniform, powerlaw_neutral]
+  extreme_families: [dirichlet_uniform, powerlaw_neutral]
+  extreme_dirichlet_alpha_choices: [0.05, 50.0]

@@ -50,7 +50,17 @@ class UNet1D(nn.Module):
     Encoder: depth down-blocks, each halving spatial dimension with MaxPool1d(2).
     Bottleneck: one ConvBlock at the lowest resolution.
     Decoder: depth up-blocks, each doubling with interpolation + skip concat.
-    Head: softmax (output sums to 1) or softplus + renorm.
+    Head: one of
+        'softmax'         normalized density (sum=1) via softmax
+        'softplus_renorm' normalized density (sum=1) via softplus then divide by sum
+        'softplus'        NON-normalized non-negative output (softplus); can emit
+                          true zeros, used with a log-compressed target
+        'relu'            NON-normalized non-negative output (relu)
+
+    Normalized heads (softmax, softplus_renorm) must be paired with a plain
+    density target; non-normalized heads (softplus, relu) must be paired with a
+    log-compressed target. build_preprocessors() enforces this; see
+    tests/test_leakage.py::test_preprocessor_head_match.
 
     Parameters
     ----------
@@ -58,8 +68,11 @@ class UNet1D(nn.Module):
     out_ch : output channels (1)
     base   : base channel count for the first encoder block
     depth  : number of encoder/decoder levels
-    head   : 'softmax' or 'softplus'
+    head   : 'softmax' | 'softplus_renorm' | 'softplus' | 'relu'
     """
+
+    NORMALIZED_HEADS = ("softmax", "softplus_renorm")
+    UNNORMALIZED_HEADS = ("softplus", "relu")
 
     def __init__(
         self,
@@ -144,9 +157,17 @@ class UNet1D(nn.Module):
         # Apply head activation
         if self.head == "softmax":
             x = torch.softmax(x, dim=-1)
-        else:
+        elif self.head == "softplus_renorm":
             x = F.softplus(x)
             s = x.sum(dim=-1, keepdim=True).clamp(min=1e-8)
             x = x / s
+        elif self.head == "softplus":
+            # Non-normalized: can approach a true zero, so a log-compressed
+            # target's near-zero tail is reachable.
+            x = F.softplus(x)
+        elif self.head == "relu":
+            x = F.relu(x)
+        else:
+            raise ValueError(f"Unknown head: {self.head!r}")
 
         return x

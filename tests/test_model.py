@@ -41,15 +41,36 @@ def test_softmax_head_sums_to_one():
     torch.testing.assert_close(sums, torch.ones(8), atol=1e-5, rtol=1e-5)
 
 
-def test_softplus_head_positive_and_normalized():
-    """Softplus head: output is non-negative and normalized."""
+def test_softplus_renorm_head_positive_and_normalized():
+    """softplus_renorm head: output is non-negative and normalized (sum=1)."""
+    model = UNet1D(in_ch=1, out_ch=1, base=16, depth=3, head="softplus_renorm")
+    x = make_input(B=4, L=360)
+    with torch.no_grad():
+        out = model(x)
+    assert (out >= 0).all(), "softplus_renorm head output should be non-negative"
+    sums = out.sum(dim=-1).squeeze(1)
+    torch.testing.assert_close(sums, torch.ones(4), atol=1e-5, rtol=1e-5)
+
+
+def test_softplus_head_positive_not_normalized():
+    """softplus head (v0.4): non-negative and NON-normalized (can emit zeros)."""
     model = UNet1D(in_ch=1, out_ch=1, base=16, depth=3, head="softplus")
     x = make_input(B=4, L=360)
     with torch.no_grad():
         out = model(x)
     assert (out >= 0).all(), "softplus head output should be non-negative"
+    # It must NOT be forced to sum to 1 (that's the whole point of the head).
     sums = out.sum(dim=-1).squeeze(1)
-    torch.testing.assert_close(sums, torch.ones(4), atol=1e-5, rtol=1e-5)
+    assert not torch.allclose(sums, torch.ones(4), atol=1e-3)
+
+
+def test_relu_head_non_negative():
+    """relu head: non-negative, non-normalized, can emit exact zeros."""
+    model = UNet1D(in_ch=1, out_ch=1, base=16, depth=3, head="relu")
+    x = make_input(B=4, L=360)
+    with torch.no_grad():
+        out = model(x)
+    assert (out >= 0).all(), "relu head output should be non-negative"
 
 
 def test_different_depths():

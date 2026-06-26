@@ -97,11 +97,14 @@ def evaluate_gcr(
     cfg,
     input_pre: Preprocessor,
     energy_grid: np.ndarray,
+    target_pre: Preprocessor | None = None,
 ) -> dict[str, float]:
-    """Evaluate model on the GCR spectrum.
+    """Evaluate model on the deployment (GCR) spectrum.
 
-    Loads GCR file, resamples to canonical grid, runs model on SiC input,
-    compares predicted TEPC to true TEPC.
+    Loads the deployment file, resamples to canonical grid, runs model on the
+    SiC input, and compares the predicted output to the true target. The
+    spectrum's physical origin is treated as unknown; this function is the ONLY
+    place (besides scripts/run_gcr.py) allowed to touch that file.
 
     Parameters
     ----------
@@ -109,6 +112,9 @@ def evaluate_gcr(
     cfg          : OmegaConf config
     input_pre    : Preprocessor for the network input (detector A)
     energy_grid  : (N,) canonical keV grid
+    target_pre   : Preprocessor for the target. Required to correctly invert a
+                   non-normalized (log-compressed) head's output. If None, the
+                   output is assumed to already be a density (normalized head).
 
     Returns
     -------
@@ -135,10 +141,17 @@ def evaluate_gcr(
     with torch.no_grad():
         pred_t = model(x.to(device)).cpu().squeeze().numpy()  # (N,)
 
-    # The softmax head already outputs a normalized density -- do NOT apply any
-    # log-inverse here. Just renormalize both to densities for a fair compare.
+    # Decode the prediction back to density space. For a normalized head this is
+    # a no-op on shape (target_pre.log_compress is False); for a non-normalized
+    # head it applies expm1/scale to undo the log compression. Then renormalize
+    # both to densities for a fair, scale-invariant comparison.
+    if target_pre is not None:
+        pred_density = target_pre.inverse_transform(pred_t, total_counts=1.0)
+    else:
+        pred_density = np.clip(pred_t, 0.0, None)
+
     tepc_norm = tepc_resampled / (tepc_resampled.sum() + 1e-30)
-    pred_norm = pred_t / (pred_t.sum() + 1e-30)
+    pred_norm = pred_density / (pred_density.sum() + 1e-30)
 
     pred_tensor = torch.from_numpy(pred_norm.astype(np.float32)).unsqueeze(0)
     target_tensor = torch.from_numpy(tepc_norm.astype(np.float32)).unsqueeze(0)

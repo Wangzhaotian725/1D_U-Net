@@ -77,17 +77,28 @@ def test_synth_neutral():
         assert (w >= 0).all(), f"Family {family!r} returned negative weights"
         assert w.sum() > 0, f"Family {family!r} returned all-zero weights"
 
+    # powerlaw_neutral must use a RANDOM exponent over a generic range, not a
+    # fixed physical index. Drawing many samples should yield varied weightings.
+    weights = [
+        tuple(np.round(sample_weights(n, "powerlaw_neutral", np.random.default_rng(s),
+                                      energies_MeV=energies), 6))
+        for s in range(20)
+    ]
+    assert len(set(weights)) > 1, \
+        "powerlaw_neutral must randomize its exponent (no fixed physical index)"
+
 
 # ---------------------------------------------------------------------------
 # 3. Heldout energies are disjoint from training energies
 # ---------------------------------------------------------------------------
 
 def test_heldout_disjoint():
-    """Training and heldout energy sets must be disjoint."""
+    """Training and heldout energy sets must be disjoint (13-energy set)."""
     from src.synth import SynthGenerator
 
-    all_energies = [200, 300, 400, 500, 600, 800, 1000, 2000, 4000, 7000, 10000]
-    heldout = [600, 2000, 7000]
+    all_energies = [90, 100, 200, 300, 400, 500, 600, 800, 1000, 2000, 4000, 7000, 10000]
+    heldout = [100, 600, 2000, 7000]
+    assert len(all_energies) == 13
 
     heldout_set = set(heldout)
     train_energies = [e for e in all_energies if e not in heldout_set]
@@ -113,13 +124,139 @@ def test_heldout_disjoint():
 # ---------------------------------------------------------------------------
 
 def test_config_select_uses_heldout_only():
-    """experiment_v2.yaml has gcr_file, but train.py's train() body does not
-    reference GCR_spectrum."""
+    """Configs carry gcr_file, but train.py's train() body does not reference it."""
     root = Path(__file__).parent.parent
 
-    cfg = OmegaConf.load(root / "configs" / "experiment_v2.yaml")
-    assert "gcr_file" in cfg.data, "cfg.data.gcr_file must be present in experiment_v2.yaml"
+    for name in ("experiment_v2.yaml", "experiment_v4.yaml", "experiment_v5.yaml"):
+        cfg = OmegaConf.load(root / "configs" / name)
+        assert "gcr_file" in cfg.data, f"cfg.data.gcr_file must be present in {name}"
 
     train_src = (root / "src" / "train.py").read_text()
     assert "GCR_spectrum" not in train_src, \
         "src/train.py must not reference GCR_spectrum (only evaluate_gcr may)"
+
+
+# ---------------------------------------------------------------------------
+# 5. Preprocessor / head pairing is locked (mirror of the v0.1 fatal bug)
+# ---------------------------------------------------------------------------
+
+def test_preprocessor_head_match():
+    """Normalized head -> plain-density target; non-normalized head -> log target."""
+    from src.preprocessing import build_preprocessors
+
+    base = {
+        "preprocessing": {"normalize_to_density": True, "log_compress": True, "log_scale": 1e4},
+    }
+
+    # Normalized heads: target must NOT be log-compressed.
+    for head in ("softmax", "softplus_renorm"):
+        cfg = OmegaConf.create({**base, "model": {"head": head}})
+        _, target_pre = build_preprocessors(cfg)
+        assert target_pre.log_compress is False, \
+            f"normalized head {head!r} must use a plain-density target"
+
+    # Non-normalized heads: target MUST be log-compressed (shares the head space).
+    for head in ("softplus", "relu"):
+        cfg = OmegaConf.create({**base, "model": {"head": head}})
+        _, target_pre = build_preprocessors(cfg)
+        assert target_pre.log_compress is True, \
+            f"non-normalized head {head!r} must use a log-compressed target"
+
+
+# ---------------------------------------------------------------------------
+# 6. Mass-conservation term in the loss behaves correctly
+# ---------------------------------------------------------------------------
+
+def test_mass_conservation_loss():
+    """w_mass>0 penalizes integral mismatch; identical spectra give ~zero mass."""
+    import torch
+    from src.losses import SpectrumLoss
+
+    loss = SpectrumLoss(w_mse=0.0, w_emd=0.0, w_mass=1.0, log_scale=1e4)
+    # Two log-compressed spectra with the same decoded mass -> mass term ~ 0.
+    x = torch.rand(4, 360)
+    _, d_same = loss(x, x.clone())
+    assert d_same["mass"].item() < 1e-6
+
+    # Scaling one up increases decoded mass mismatch -> positive penalty.
+    _, d_diff = loss(x + 1.0, x)
+    assert d_diff["mass"].item() > 0.0
+
+
+# ---------------------------------------------------------------------------
+# 7. Model selection / early stopping reads only heldout/wide metrics, not GCR
+# ---------------------------------------------------------------------------
+
+def test_selection_uses_no_gcr():
+    """The selection signals in train.py are derived from heldout/wide loaders
+    only; no GCR-derived quantity feeds early stopping or best-checkpointing."""
+    root = Path(__file__).parent.parent
+    train_src = (root / "src" / "train.py").read_text()
+
+    # The composite/selection logic must not mention any GCR symbol.
+    for token in ("gcr", "GCR", "evaluate_gcr", "gcr_file"):
+        assert token not in train_src, \
+            f"src/train.py selection path must not reference {token!r}"
+
+
+# ---------------------------------------------------------------------------
+# 8. Pre-registration: frozen config committed before GCR results exist
+# ---------------------------------------------------------------------------
+
+def test_frozen_before_gcr():
+    """If both the frozen config and GCR results exist, the frozen config must
+    be no newer than the GCR results (config chosen before the single eval)."""
+    root = Path(__file__).parent.parent
+    frozen = root / "results" / "v4" / "frozen_config.md"
+    gcr = root / "results" / "v4" / "gcr_metrics.json"
+
+    if not frozen.exists() or not gcr.exists():
+        import pytest
+        pytest.skip("frozen_config.md or gcr_metrics.json not present yet")
+
+    assert frozen.stat().st_mtime <= gcr.stat().st_mtime + 1.0, \
+        "frozen_config.md must be written/committed before GCR evaluation"
+
+
+# ---------------------------------------------------------------------------
+# 9. v0.5 pre-registration: frozen config committed before GCR results
+# ---------------------------------------------------------------------------
+
+def test_frozen_before_gcr_v5():
+    """v0.5: results/v5/frozen_config.md must be older than gcr_metrics.json."""
+    root = Path(__file__).parent.parent
+    frozen = root / "results" / "v5" / "frozen_config.md"
+    gcr = root / "results" / "v5" / "gcr_metrics.json"
+
+    if not frozen.exists() or not gcr.exists():
+        pytest.skip("v5 frozen_config.md or gcr_metrics.json not present yet")
+
+    assert frozen.stat().st_mtime <= gcr.stat().st_mtime + 1.0, \
+        "results/v5/frozen_config.md must be committed before GCR evaluation"
+
+
+# ---------------------------------------------------------------------------
+# 10. v0.5 loss components: selection_score uses no GCR; peak/region legal
+# ---------------------------------------------------------------------------
+
+def test_v5_selection_score_uses_no_gcr():
+    """selection_score in train.py must not reference any GCR symbol."""
+    root = Path(__file__).parent.parent
+    train_src = (root / "src" / "train.py").read_text()
+    for token in ("gcr", "GCR", "evaluate_gcr", "gcr_file", "GCR_spectrum"):
+        assert token not in train_src, \
+            f"src/train.py must not reference {token!r} in selection logic"
+
+
+def test_v5_config_uses_selection_score():
+    """experiment_v5.yaml must use selection_score as early_stop_metric."""
+    root = Path(__file__).parent.parent
+    cfg = OmegaConf.load(root / "configs" / "experiment_v5.yaml")
+    assert cfg.train.early_stop_metric == "selection_score", \
+        "v0.5 must use selection_score as early_stop_metric"
+    assert "lambda_region" in cfg.train, \
+        "v0.5 config must carry lambda_region"
+    assert "w_peak" in cfg.loss, \
+        "v0.5 config must carry loss.w_peak"
+    assert cfg.model.head in ("softmax", "softplus_renorm"), \
+        f"v0.5 must use a normalized head, got {cfg.model.head!r}"
