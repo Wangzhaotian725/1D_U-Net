@@ -15,7 +15,7 @@ from omegaconf import OmegaConf
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from src.evaluate import evaluate_gcr
-from src.model import UNet1D
+from src.model import UNet1D, build_model
 from src.plots import plot_cdf_comparison, plot_spectrum_comparison
 from src.preprocessing import Preprocessor, build_preprocessors
 
@@ -79,13 +79,7 @@ def main() -> None:
 
     # Load model
     ckpt = torch.load(args.ckpt, map_location="cpu", weights_only=False)
-    model = UNet1D(
-        in_ch=cfg.model.in_ch,
-        out_ch=1,
-        base=cfg.model.base_channels,
-        depth=cfg.model.depth,
-        head=cfg.model.head,
-    )
+    model = build_model(cfg)
     model.load_state_dict(ckpt["model"])
     model.eval()
 
