@@ -152,6 +152,7 @@ class SpectrumLoss(nn.Module):
     peak_window_half : half-width (bins) of the peak centroid window
     region_weight : (N,) per-bin weights for MSE. If None, uniform weighting.
                     Use build_region_weight() to construct from an energy grid.
+    w_unimodal    : weight for differentiable unimodal regulariser (v0.6). 0 disables.
     """
 
     def __init__(
@@ -164,6 +165,7 @@ class SpectrumLoss(nn.Module):
         w_peak: float = 0.0,
         peak_window_half: int = 30,
         region_weight: torch.Tensor | None = None,
+        w_unimodal: float = 0.0,
     ) -> None:
         super().__init__()
         self.w_mse = w_mse
@@ -172,6 +174,7 @@ class SpectrumLoss(nn.Module):
         self.log_scale = log_scale
         self.w_peak = w_peak
         self.peak_window_half = peak_window_half
+        self.w_unimodal = w_unimodal
         if bin_dist is not None:
             self.register_buffer("bin_dist", bin_dist)
         else:
@@ -232,9 +235,17 @@ class SpectrumLoss(nn.Module):
         else:
             peak = torch.zeros((), device=pred.device)
 
+        if self.w_unimodal > 0:
+            from src.metrics import unimodal_loss
+            uni = unimodal_loss(pred)
+            total = total + self.w_unimodal * uni
+        else:
+            uni = torch.zeros((), device=pred.device)
+
         return total, {
             "mse": mse.detach(),
             "emd": emd.detach(),
             "mass": mass.detach(),
             "peak": peak.detach(),
+            "unimodal": uni.detach(),
         }

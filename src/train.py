@@ -24,7 +24,8 @@ from src.losses import (
     emd_1d,
     make_bin_dist,
 )
-from src.model import UNet1D
+from src.metrics import batch_secondary_peak_ratio
+from src.model import UNet1D, build_model
 from src.preprocessing import Preprocessor, build_preprocessors
 from src.synth import SynthGenerator
 
@@ -225,6 +226,22 @@ def eval_region_emd(
 
 
 @torch.no_grad()
+def eval_secondary_peak_ratio(model, loader, device, use_amp) -> float:
+    """Mean secondary_peak_ratio over a loader's predictions."""
+    model.eval()
+    all_preds = []
+    for batch in loader:
+        x = batch["input"].to(device)
+        with torch.amp.autocast("cuda", enabled=use_amp):
+            pred = model(x)
+        all_preds.append(pred.cpu().float())
+    if not all_preds:
+        return 0.0
+    preds = torch.cat(all_preds, dim=0)
+    return batch_secondary_peak_ratio(preds)
+
+
+@torch.no_grad()
 def eval_peak_error(model, loader, device, use_amp) -> float:
     """Mean |argmax(pred) - argmax(target)| in bins.
 
@@ -325,13 +342,7 @@ def train(cfg, fast_dev_run: bool = False) -> None:
     mono_held_loader = DataLoader(mono_held_ds, batch_size=batch_size, shuffle=False, num_workers=0)
 
     # Model
-    model = UNet1D(
-        in_ch=cfg.model.in_ch,
-        out_ch=1,
-        base=cfg.model.base_channels,
-        depth=cfg.model.depth,
-        head=cfg.model.head,
-    ).to(device)
+    model = build_model(cfg).to(device)
 
     n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(f"Model parameters: {n_params:,}")
@@ -360,11 +371,12 @@ def train(cfg, fast_dev_run: bool = False) -> None:
     mass_log_scale = float(cfg.preprocessing.log_scale) if target_is_log else None
     w_peak = float(cfg.loss.get("w_peak", 0.0))
     peak_window_half = int(cfg.loss.get("peak_window_half", 30))
+    w_unimodal = float(cfg.loss.get("w_unimodal", 0.0))
     criterion = SpectrumLoss(
         w_mse=cfg.loss.w_mse, w_emd=cfg.loss.w_emd, bin_dist=bin_dist,
         w_mass=w_mass, log_scale=mass_log_scale,
         w_peak=w_peak, peak_window_half=peak_window_half,
-        region_weight=rw,
+        region_weight=rw, w_unimodal=w_unimodal,
     ).to(device)
 
     # Optimizer
@@ -401,9 +413,10 @@ def train(cfg, fast_dev_run: bool = False) -> None:
     # (which EMD alone let regress in v0.2). No deployment-spectrum info is used.
     composite_w_emd = float(cfg.train.get("composite_w_emd", 1.0))
     composite_w_peak = float(cfg.train.get("composite_w_peak", 0.1))
-    # selection_score (v0.5): peak_err + lambda_region * region_emd.
-    # Peak position is the primary criterion; region EMD is a secondary shape check.
+    # selection_score (v0.6): peak_err + lambda_region*region_emd + lambda_spr*secondary_peak_ratio.
+    # All computed on held-out energies only; no deployment-spectrum information is used.
     lambda_region = float(cfg.train.get("lambda_region", 0.3))
+    lambda_spr = float(cfg.train.get("lambda_secondary_peak_ratio", 0.5))
     patience_counter = 0
 
     for epoch in range(epochs):
@@ -459,17 +472,18 @@ def train(cfg, fast_dev_run: bool = False) -> None:
         wide_emd = eval_emd(model, wide_loader, criterion, device, use_amp)
         extreme_emd = eval_emd(model, extreme_loader, criterion, device, use_amp)
         peak_err = eval_peak_error(model, mono_held_loader, device, use_amp)
+        spr = eval_secondary_peak_ratio(model, mono_held_loader, device, use_amp)
         composite = composite_w_emd * wide_emd + composite_w_peak * peak_err
 
-        # selection_score (v0.5): peak-primary, region-EMD secondary. All computed
-        # on held-out energies only; no deployment-spectrum information is used.
+        # selection_score (v0.6): peak-primary, region-EMD secondary, spr tertiary.
+        # All computed on held-out energies only; no deployment-spectrum information is used.
         if region_mask is not None:
             region_emd = eval_region_emd(
                 model, wide_loader, device, use_amp, region_mask
             )
         else:
             region_emd = wide_emd
-        score = peak_err + lambda_region * region_emd
+        score = peak_err + lambda_region * region_emd + lambda_spr * spr
 
         # Selection metric dispatch
         if early_stop_metric == "selection_score":
@@ -486,6 +500,7 @@ def train(cfg, fast_dev_run: bool = False) -> None:
         writer.add_scalar("EMD/extreme", extreme_emd, epoch)
         writer.add_scalar("EMD/region", region_emd, epoch)
         writer.add_scalar("PeakErr/heldout_mono", peak_err, epoch)
+        writer.add_scalar("SPR/heldout_mono", spr, epoch)
         writer.add_scalar("Composite/wide", composite, epoch)
         writer.add_scalar("Score/selection", score, epoch)
         writer.add_scalar("LR", lr, epoch)
@@ -495,7 +510,7 @@ def train(cfg, fast_dev_run: bool = False) -> None:
                 f"Epoch {epoch+1:4d}/{epochs} | "
                 f"train={avg_train:.4f} val={avg_val:.4f} val_emd={avg_val_emd:.4f} | "
                 f"wide={wide_emd:.4f} region={region_emd:.4f} peak={peak_err:.2f} "
-                f"score={score:.4f} lr={lr:.2e}"
+                f"spr={spr:.3f} score={score:.4f} lr={lr:.2e}"
             )
 
         # Checkpoint
@@ -509,6 +524,7 @@ def train(cfg, fast_dev_run: bool = False) -> None:
             "extreme_emd": extreme_emd,
             "region_emd": region_emd,
             "heldout_peak_error": peak_err,
+            "heldout_spr": spr,
             "composite_wide": composite,
             "selection_score": score,
             "cfg": OmegaConf.to_container(cfg),

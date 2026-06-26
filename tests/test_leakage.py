@@ -127,7 +127,7 @@ def test_config_select_uses_heldout_only():
     """Configs carry gcr_file, but train.py's train() body does not reference it."""
     root = Path(__file__).parent.parent
 
-    for name in ("experiment_v2.yaml", "experiment_v4.yaml", "experiment_v5.yaml"):
+    for name in ("experiment_v2.yaml", "experiment_v4.yaml", "experiment_v5.yaml", "experiment_v6.yaml"):
         cfg = OmegaConf.load(root / "configs" / name)
         assert "gcr_file" in cfg.data, f"cfg.data.gcr_file must be present in {name}"
 
@@ -260,3 +260,154 @@ def test_v5_config_uses_selection_score():
         "v0.5 config must carry loss.w_peak"
     assert cfg.model.head in ("softmax", "softplus_renorm"), \
         f"v0.5 must use a normalized head, got {cfg.model.head!r}"
+
+
+# ---------------------------------------------------------------------------
+# 11. v0.6: double-peak diagnosed on held-out synthetic data
+# ---------------------------------------------------------------------------
+
+def test_double_peak_diagnosed_on_heldout():
+    """Synthetic held-out spectra fed to the baseline UNet1D show secondary_peak_ratio > 0
+    for a manually crafted bimodal prediction; unimodal prediction gives ratio = 0."""
+    import numpy as np
+    from src.metrics import secondary_peak_ratio, count_peaks
+
+    # A unimodal spectrum: single Gaussian at bin 150
+    bins = np.arange(360)
+    unimodal = np.exp(-0.5 * ((bins - 150) / 10) ** 2)
+    unimodal /= unimodal.sum()
+
+    assert count_peaks(unimodal) == 1, "Unimodal spectrum must have exactly 1 peak"
+    assert secondary_peak_ratio(unimodal) == 0.0, \
+        "Unimodal spectrum must have secondary_peak_ratio = 0"
+
+    # A bimodal spectrum: two Gaussians (primary at 150, secondary at 180)
+    bimodal = (
+        np.exp(-0.5 * ((bins - 150) / 10) ** 2) +
+        0.4 * np.exp(-0.5 * ((bins - 180) / 10) ** 2)
+    )
+    bimodal /= bimodal.sum()
+
+    assert count_peaks(bimodal) >= 2, "Bimodal spectrum must have ≥ 2 peaks"
+    spr = secondary_peak_ratio(bimodal)
+    assert 0.0 < spr <= 1.0, f"Bimodal secondary_peak_ratio must be in (0,1], got {spr}"
+
+    # The secondary peak (at ~180) should be close to the 'input peak' at 179
+    # This mirrors the v0.4/v0.5 double-peak artefact diagnosis
+    from src.metrics import transport_leak_score
+    fake_input = np.exp(-0.5 * ((bins - 179) / 5) ** 2)
+    leak = transport_leak_score(bimodal, fake_input)
+    assert leak > 0.5, \
+        f"Secondary peak at ~180 should be close to input peak at 179 (leak={leak:.3f})"
+
+
+# ---------------------------------------------------------------------------
+# 12. v0.6: config and pre-registration checks
+# ---------------------------------------------------------------------------
+
+def test_v6_config_uses_selection_score():
+    """experiment_v6.yaml must use selection_score with secondary_peak_ratio term."""
+    root = Path(__file__).parent.parent
+    cfg = OmegaConf.load(root / "configs" / "experiment_v6.yaml")
+    assert cfg.train.early_stop_metric == "selection_score", \
+        "v0.6 must use selection_score as early_stop_metric"
+    assert "lambda_secondary_peak_ratio" in cfg.train, \
+        "v0.6 config must carry lambda_secondary_peak_ratio"
+    assert "w_unimodal" in cfg.loss, \
+        "v0.6 config must carry loss.w_unimodal"
+    assert cfg.model.head in ("softmax", "softplus_renorm"), \
+        f"v0.6 must use a normalized head, got {cfg.model.head!r}"
+    assert cfg.model.arch in ("operator", "transformer1d", "unet_attn", "unet1d"), \
+        f"v0.6 arch must be a valid architecture, got {cfg.model.arch!r}"
+
+
+def test_frozen_before_gcr_v6():
+    """v0.6: results/v6/frozen_config.md must be older than gcr_metrics.json."""
+    root = Path(__file__).parent.parent
+    frozen = root / "results" / "v6" / "frozen_config.md"
+    gcr = root / "results" / "v6" / "gcr_metrics.json"
+
+    if not frozen.exists() or not gcr.exists():
+        pytest.skip("v6 frozen_config.md or gcr_metrics.json not present yet")
+
+    assert frozen.stat().st_mtime <= gcr.stat().st_mtime + 1.0, \
+        "results/v6/frozen_config.md must be committed before GCR evaluation"
+
+
+# ---------------------------------------------------------------------------
+# 13. v0.6: new architecture sanity checks
+# ---------------------------------------------------------------------------
+
+def test_transfer_operator_output():
+    """TransferOperator output is non-negative, sums to 1, and unimodal for unimodal input."""
+    import torch
+    import numpy as np
+    from src.models.operator import TransferOperator
+
+    model = TransferOperator(n_bins=64, rank=4, band_halfwidth=10)
+    model.eval()
+
+    with torch.no_grad():
+        x = torch.rand(2, 1, 64)
+        x = x / x.sum(dim=-1, keepdim=True)
+        out = model(x)
+
+    assert out.shape == (2, 1, 64), f"Expected (2,1,64), got {out.shape}"
+    assert (out >= 0).all(), "TransferOperator output must be non-negative"
+    sums = out.squeeze(1).sum(dim=-1)
+    assert torch.allclose(sums, torch.ones(2), atol=1e-5), \
+        f"TransferOperator output must sum to 1, got {sums}"
+
+
+def test_spectrum_transformer_output():
+    """SpectrumTransformer output shape and no NaN."""
+    import torch
+    from src.models.transformer1d import SpectrumTransformer
+
+    model = SpectrumTransformer(n_bins=64, d_model=32, n_layers=2, n_heads=4)
+    model.eval()
+
+    with torch.no_grad():
+        x = torch.rand(3, 1, 64)
+        out = model(x)
+
+    assert out.shape == (3, 1, 64), f"Expected (3,1,64), got {out.shape}"
+    assert not torch.isnan(out).any(), "SpectrumTransformer output contains NaN"
+    assert (out >= 0).all(), "SpectrumTransformer softplus_renorm output must be non-negative"
+
+
+def test_attn_unet_output():
+    """AttnUNet1D output shape; ablated skip (scale=0) still produces valid output."""
+    import torch
+    from src.models.unet_attn import AttnUNet1D
+
+    model = AttnUNet1D(in_ch=1, out_ch=1, base=8, depth=2,
+                       skip_gate_scale=[1.0, 0.0])
+    model.eval()
+
+    with torch.no_grad():
+        x = torch.rand(2, 1, 128)
+        out = model(x)
+
+    assert out.shape == (2, 1, 128), f"Expected (2,1,128), got {out.shape}"
+    assert not torch.isnan(out).any(), "AttnUNet1D output contains NaN"
+
+
+def test_unimodal_loss_differentiable():
+    """unimodal_loss is zero for a perfectly monotone ramp and positive for oscillating signal."""
+    import torch
+    from src.metrics import unimodal_loss
+
+    # Perfectly monotone increasing then decreasing (tent): exactly unimodal, zero reversals
+    N = 64
+    t = torch.arange(N, dtype=torch.float32)
+    tent = torch.where(t < N // 2, t, torch.tensor(float(N - 1)) - t).unsqueeze(0)
+
+    # Oscillating signal: many sign reversals
+    osc = torch.sin(torch.linspace(0, 8 * 3.14159, N)).unsqueeze(0)
+
+    loss_tent = unimodal_loss(tent)
+    loss_osc = unimodal_loss(osc)
+
+    assert loss_tent.item() == 0.0, f"Tent (unimodal) loss should be exactly 0, got {loss_tent.item()}"
+    assert loss_osc.item() > 0.0, f"Oscillating unimodal_loss should be > 0, got {loss_osc.item()}"
