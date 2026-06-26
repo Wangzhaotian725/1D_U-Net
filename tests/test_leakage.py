@@ -127,7 +127,7 @@ def test_config_select_uses_heldout_only():
     """Configs carry gcr_file, but train.py's train() body does not reference it."""
     root = Path(__file__).parent.parent
 
-    for name in ("experiment_v2.yaml", "experiment_v4.yaml", "experiment_v5.yaml", "experiment_v6.yaml"):
+    for name in ("experiment_v2.yaml", "experiment_v4.yaml", "experiment_v5.yaml", "experiment_v6.yaml", "experiment_v7.yaml"):
         cfg = OmegaConf.load(root / "configs" / name)
         assert "gcr_file" in cfg.data, f"cfg.data.gcr_file must be present in {name}"
 
@@ -411,3 +411,36 @@ def test_unimodal_loss_differentiable():
 
     assert loss_tent.item() == 0.0, f"Tent (unimodal) loss should be exactly 0, got {loss_tent.item()}"
     assert loss_osc.item() > 0.0, f"Oscillating unimodal_loss should be > 0, got {loss_osc.item()}"
+
+
+# ---------------------------------------------------------------------------
+# 14. v0.7: config checks and pre-registration guard
+# ---------------------------------------------------------------------------
+
+def test_v7_config():
+    """experiment_v7.yaml must use unet_attn with stronger unimodal loss."""
+    root = Path(__file__).parent.parent
+    cfg = OmegaConf.load(root / "configs" / "experiment_v7.yaml")
+    assert cfg.model.arch == "unet_attn", \
+        "v0.7 must use unet_attn (skip connections + attention gates)"
+    assert cfg.train.early_stop_metric == "selection_score"
+    assert float(cfg.loss.w_unimodal) >= 1.5, \
+        "v0.7 must use w_unimodal >= 1.5 (4x stronger than v0.6)"
+    assert float(cfg.loss.w_peak) >= 2.5, \
+        "v0.7 must use w_peak >= 2.5"
+    assert float(cfg.train.lambda_secondary_peak_ratio) >= 0.8, \
+        "v0.7 lambda_secondary_peak_ratio must be >= 0.8"
+    assert cfg.model.head in ("softmax", "softplus_renorm")
+
+
+def test_frozen_before_gcr_v7():
+    """v0.7: results/v7/frozen_config.md must be older than gcr_metrics.json."""
+    root = Path(__file__).parent.parent
+    frozen = root / "results" / "v7" / "frozen_config.md"
+    gcr = root / "results" / "v7" / "gcr_metrics.json"
+
+    if not frozen.exists() or not gcr.exists():
+        pytest.skip("v7 frozen_config.md or gcr_metrics.json not present yet")
+
+    assert frozen.stat().st_mtime <= gcr.stat().st_mtime + 1.0, \
+        "results/v7/frozen_config.md must be committed before GCR evaluation"
