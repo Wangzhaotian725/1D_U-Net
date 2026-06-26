@@ -365,7 +365,7 @@ def train(cfg, fast_dev_run: bool = False) -> None:
         w_mass=w_mass, log_scale=mass_log_scale,
         w_peak=w_peak, peak_window_half=peak_window_half,
         region_weight=rw,
-    )
+    ).to(device)
 
     # Optimizer
     optimizer = torch.optim.AdamW(

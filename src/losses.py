@@ -87,7 +87,8 @@ def soft_peak_loss(
     scalar mean squared centroid offset
     """
     N = pred.shape[-1]
-    idx = torch.arange(N, dtype=pred.dtype, device=pred.device)  # (N,)
+    dev = pred.device
+    idx = torch.arange(N, dtype=pred.dtype, device=dev)  # (N,)
 
     # Hard argmax of target — used only to centre the window, no gradient needed.
     peak_idx = target.argmax(dim=-1)  # (B,)
@@ -209,7 +210,8 @@ class SpectrumLoss(nn.Module):
         # MSE: apply region_weight if provided
         sq_err = (pred - target) ** 2
         if self.region_weight is not None:
-            mse = (sq_err * self.region_weight).mean()
+            rw = self.region_weight.to(pred.device)
+            mse = (sq_err * rw).mean()
         else:
             mse = sq_err.mean()
 
