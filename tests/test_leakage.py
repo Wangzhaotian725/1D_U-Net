@@ -127,7 +127,7 @@ def test_config_select_uses_heldout_only():
     """Configs carry gcr_file, but train.py's train() body does not reference it."""
     root = Path(__file__).parent.parent
 
-    for name in ("experiment_v2.yaml", "experiment_v4.yaml"):
+    for name in ("experiment_v2.yaml", "experiment_v4.yaml", "experiment_v5.yaml"):
         cfg = OmegaConf.load(root / "configs" / name)
         assert "gcr_file" in cfg.data, f"cfg.data.gcr_file must be present in {name}"
 
@@ -216,3 +216,47 @@ def test_frozen_before_gcr():
 
     assert frozen.stat().st_mtime <= gcr.stat().st_mtime + 1.0, \
         "frozen_config.md must be written/committed before GCR evaluation"
+
+
+# ---------------------------------------------------------------------------
+# 9. v0.5 pre-registration: frozen config committed before GCR results
+# ---------------------------------------------------------------------------
+
+def test_frozen_before_gcr_v5():
+    """v0.5: results/v5/frozen_config.md must be older than gcr_metrics.json."""
+    root = Path(__file__).parent.parent
+    frozen = root / "results" / "v5" / "frozen_config.md"
+    gcr = root / "results" / "v5" / "gcr_metrics.json"
+
+    if not frozen.exists() or not gcr.exists():
+        pytest.skip("v5 frozen_config.md or gcr_metrics.json not present yet")
+
+    assert frozen.stat().st_mtime <= gcr.stat().st_mtime + 1.0, \
+        "results/v5/frozen_config.md must be committed before GCR evaluation"
+
+
+# ---------------------------------------------------------------------------
+# 10. v0.5 loss components: selection_score uses no GCR; peak/region legal
+# ---------------------------------------------------------------------------
+
+def test_v5_selection_score_uses_no_gcr():
+    """selection_score in train.py must not reference any GCR symbol."""
+    root = Path(__file__).parent.parent
+    train_src = (root / "src" / "train.py").read_text()
+    for token in ("gcr", "GCR", "evaluate_gcr", "gcr_file", "GCR_spectrum"):
+        assert token not in train_src, \
+            f"src/train.py must not reference {token!r} in selection logic"
+
+
+def test_v5_config_uses_selection_score():
+    """experiment_v5.yaml must use selection_score as early_stop_metric."""
+    root = Path(__file__).parent.parent
+    cfg = OmegaConf.load(root / "configs" / "experiment_v5.yaml")
+    assert cfg.train.early_stop_metric == "selection_score", \
+        "v0.5 must use selection_score as early_stop_metric"
+    assert "lambda_region" in cfg.train, \
+        "v0.5 config must carry lambda_region"
+    assert "w_peak" in cfg.loss, \
+        "v0.5 config must carry loss.w_peak"
+    assert cfg.model.head in ("softmax", "softplus_renorm"), \
+        f"v0.5 must use a normalized head, got {cfg.model.head!r}"

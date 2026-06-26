@@ -17,7 +17,13 @@ from torch.utils.tensorboard import SummaryWriter
 
 from src.data import load_spectrum_file
 from src.dataset import FixedMixtureSet, SyntheticMixtureDataset
-from src.losses import SpectrumLoss, make_bin_dist
+from src.losses import (
+    SpectrumLoss,
+    build_region_mask,
+    build_region_weight,
+    emd_1d,
+    make_bin_dist,
+)
 from src.model import UNet1D
 from src.preprocessing import Preprocessor, build_preprocessors
 from src.synth import SynthGenerator
@@ -191,6 +197,34 @@ def eval_emd(model, loader, criterion, device, use_amp) -> float:
 
 
 @torch.no_grad()
+def eval_region_emd(
+    model, loader, device, use_amp, region_mask: torch.Tensor
+) -> float:
+    """Mean EMD restricted to the energy region defined by region_mask.
+
+    Both pred and target are masked to the region, then renormalized before
+    computing the 1D EMD. This measures shape matching inside the region only,
+    ignoring the high-energy tail.
+    """
+    model.eval()
+    emds = []
+    for batch in loader:
+        x = batch["input"].to(device)
+        y = batch["target"].to(device)
+        with torch.amp.autocast("cuda", enabled=use_amp):
+            pred = model(x)
+        p = pred.squeeze(1).float()
+        t = y.squeeze(1).float()
+        mask = region_mask.to(device)
+        p_r = p * mask
+        t_r = t * mask
+        p_r = p_r / p_r.sum(dim=-1, keepdim=True).clamp(min=1e-8)
+        t_r = t_r / t_r.sum(dim=-1, keepdim=True).clamp(min=1e-8)
+        emds.append(emd_1d(p_r, t_r).item())
+    return float(np.mean(emds)) if emds else float("nan")
+
+
+@torch.no_grad()
 def eval_peak_error(model, loader, device, use_amp) -> float:
     """Mean |argmax(pred) - argmax(target)| in bins.
 
@@ -306,6 +340,17 @@ def train(cfg, fast_dev_run: bool = False) -> None:
     emd_space = cfg.loss.get("emd_space", "index")
     bin_dist = make_bin_dist(energy_grid, emd_space)
 
+    # Region weighting (v0.5): focus MSE on [region_kev_lo, region_kev_hi] keV.
+    region_kev = list(cfg.loss.get("region_kev", []))
+    region_in_weight = float(cfg.loss.get("region_in_weight", 1.0))
+    region_out_weight = float(cfg.loss.get("region_out_weight", 1.0))
+    rw = (
+        build_region_weight(energy_grid, region_kev, region_in_weight, region_out_weight)
+        if region_kev
+        else None
+    )
+    region_mask = build_region_mask(energy_grid, region_kev) if region_kev else None
+
     # Loss. The mass term is only active for non-normalized heads (w_mass>0);
     # decode out of log space using the configured log_scale so the constraint
     # is on the integrated density.
@@ -313,9 +358,13 @@ def train(cfg, fast_dev_run: bool = False) -> None:
     w_mass = float(cfg.loss.get("w_mass", 0.0))
     target_is_log = head not in ("softmax", "softplus_renorm")
     mass_log_scale = float(cfg.preprocessing.log_scale) if target_is_log else None
+    w_peak = float(cfg.loss.get("w_peak", 0.0))
+    peak_window_half = int(cfg.loss.get("peak_window_half", 30))
     criterion = SpectrumLoss(
         w_mse=cfg.loss.w_mse, w_emd=cfg.loss.w_emd, bin_dist=bin_dist,
         w_mass=w_mass, log_scale=mass_log_scale,
+        w_peak=w_peak, peak_window_half=peak_window_half,
+        region_weight=rw,
     )
 
     # Optimizer
@@ -352,6 +401,9 @@ def train(cfg, fast_dev_run: bool = False) -> None:
     # (which EMD alone let regress in v0.2). No deployment-spectrum info is used.
     composite_w_emd = float(cfg.train.get("composite_w_emd", 1.0))
     composite_w_peak = float(cfg.train.get("composite_w_peak", 0.1))
+    # selection_score (v0.5): peak_err + lambda_region * region_emd.
+    # Peak position is the primary criterion; region EMD is a secondary shape check.
+    lambda_region = float(cfg.train.get("lambda_region", 0.3))
     patience_counter = 0
 
     for epoch in range(epochs):
@@ -409,25 +461,41 @@ def train(cfg, fast_dev_run: bool = False) -> None:
         peak_err = eval_peak_error(model, mono_held_loader, device, use_amp)
         composite = composite_w_emd * wide_emd + composite_w_peak * peak_err
 
-        # Selection metric: composite_wide is the v0.4 default; val_emd kept for
-        # backward compatibility / ablation.
-        select = composite if early_stop_metric == "composite_wide" else avg_val_emd
+        # selection_score (v0.5): peak-primary, region-EMD secondary. All computed
+        # on held-out energies only; no deployment-spectrum information is used.
+        if region_mask is not None:
+            region_emd = eval_region_emd(
+                model, wide_loader, device, use_amp, region_mask
+            )
+        else:
+            region_emd = wide_emd
+        score = peak_err + lambda_region * region_emd
+
+        # Selection metric dispatch
+        if early_stop_metric == "selection_score":
+            select = score
+        elif early_stop_metric == "composite_wide":
+            select = composite
+        else:
+            select = avg_val_emd
 
         writer.add_scalar("Loss/train", avg_train, epoch)
         writer.add_scalar("Loss/val", avg_val, epoch)
         writer.add_scalar("EMD/val", avg_val_emd, epoch)
         writer.add_scalar("EMD/wide", wide_emd, epoch)
         writer.add_scalar("EMD/extreme", extreme_emd, epoch)
+        writer.add_scalar("EMD/region", region_emd, epoch)
         writer.add_scalar("PeakErr/heldout_mono", peak_err, epoch)
         writer.add_scalar("Composite/wide", composite, epoch)
+        writer.add_scalar("Score/selection", score, epoch)
         writer.add_scalar("LR", lr, epoch)
 
         if (epoch + 1) % 10 == 0 or epoch == 0:
             print(
                 f"Epoch {epoch+1:4d}/{epochs} | "
                 f"train={avg_train:.4f} val={avg_val:.4f} val_emd={avg_val_emd:.4f} | "
-                f"wide={wide_emd:.4f} extreme={extreme_emd:.4f} peak={peak_err:.2f} "
-                f"composite={composite:.4f} lr={lr:.2e}"
+                f"wide={wide_emd:.4f} region={region_emd:.4f} peak={peak_err:.2f} "
+                f"score={score:.4f} lr={lr:.2e}"
             )
 
         # Checkpoint
@@ -439,8 +507,10 @@ def train(cfg, fast_dev_run: bool = False) -> None:
             "val_emd": avg_val_emd,
             "wide_emd": wide_emd,
             "extreme_emd": extreme_emd,
+            "region_emd": region_emd,
             "heldout_peak_error": peak_err,
             "composite_wide": composite,
+            "selection_score": score,
             "cfg": OmegaConf.to_container(cfg),
         }
         torch.save(state, str(ckpt_dir / "last.pt"))
