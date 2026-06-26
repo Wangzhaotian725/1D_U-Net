@@ -63,13 +63,20 @@ def emd_1d(
 
 
 class SpectrumLoss(nn.Module):
-    """Combined MSE + EMD loss for spectrum prediction.
+    """Combined MSE + EMD (+ optional mass) loss for spectrum prediction.
 
     Parameters
     ----------
-    w_mse    : weight for MSE term
-    w_emd    : weight for EMD term
-    bin_dist : (N,) or None; passed to emd_1d
+    w_mse     : weight for MSE term
+    w_emd     : weight for EMD term
+    bin_dist  : (N,) or None; passed to emd_1d
+    w_mass    : weight for the mass-conservation term. 0 disables it (the default,
+                appropriate for normalized heads whose output always sums to 1).
+                A positive value is meant for NON-normalized heads (softplus/relu)
+                which do not guarantee mass conservation.
+    log_scale : if set, the mass term is computed in decoded density space
+                (expm1(x)/log_scale), i.e. it constrains the integrals of the
+                decoded spectra to match. If None, raw transformed sums are used.
     """
 
     def __init__(
@@ -77,14 +84,24 @@ class SpectrumLoss(nn.Module):
         w_mse: float = 1.0,
         w_emd: float = 1.0,
         bin_dist: torch.Tensor | None = None,
+        w_mass: float = 0.0,
+        log_scale: float | None = None,
     ) -> None:
         super().__init__()
         self.w_mse = w_mse
         self.w_emd = w_emd
+        self.w_mass = w_mass
+        self.log_scale = log_scale
         if bin_dist is not None:
             self.register_buffer("bin_dist", bin_dist)
         else:
             self.bin_dist = None
+
+    def _mass(self, x: torch.Tensor) -> torch.Tensor:
+        """Integrated mass per sample. Decode out of log space if log_scale set."""
+        if self.log_scale is not None:
+            x = torch.expm1(x.clamp(max=20.0)) / self.log_scale
+        return x.sum(dim=-1)
 
     def forward(
         self, pred: torch.Tensor, target: torch.Tensor
@@ -98,7 +115,7 @@ class SpectrumLoss(nn.Module):
 
         Returns
         -------
-        (total_loss, {'mse': ..., 'emd': ...})
+        (total_loss, {'mse': ..., 'emd': ..., 'mass': ...})
         """
         # Flatten channel dim if present
         if pred.dim() == 3:
@@ -113,4 +130,10 @@ class SpectrumLoss(nn.Module):
 
         total = self.w_mse * mse + self.w_emd * emd
 
-        return total, {"mse": mse.detach(), "emd": emd.detach()}
+        if self.w_mass > 0:
+            mass = torch.mean((self._mass(pred) - self._mass(target)) ** 2)
+            total = total + self.w_mass * mass
+        else:
+            mass = torch.zeros((), device=pred.device)
+
+        return total, {"mse": mse.detach(), "emd": emd.detach(), "mass": mass.detach()}

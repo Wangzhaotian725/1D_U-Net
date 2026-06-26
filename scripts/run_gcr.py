@@ -79,9 +79,9 @@ def main() -> None:
     model.load_state_dict(ckpt["model"])
     model.eval()
 
-    input_pre, _ = build_preprocessors(cfg)
+    input_pre, target_pre = build_preprocessors(cfg)
 
-    results = evaluate_gcr(model, cfg, input_pre, energy_grid)
+    results = evaluate_gcr(model, cfg, input_pre, energy_grid, target_pre=target_pre)
 
     # Separate arrays from scalar metrics
     arrays = {k: v for k, v in results.items() if k.startswith("_")}

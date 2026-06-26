@@ -137,6 +137,79 @@ def build_generators(
     return train_gen, val_gen
 
 
+def build_heldout_generator(
+    mono_A: np.ndarray,
+    mono_B: np.ndarray,
+    energies_MeV: list[float],
+    heldout: list[float],
+    cfg,
+    families: list[str],
+    dirichlet_alpha_choices: list[float] | None = None,
+) -> "SynthGenerator | None":
+    """Build a SynthGenerator restricted to the held-out energies.
+
+    Used to construct the wide-spectrum and extreme-extrapolation validation
+    sets (Section 3 of the v0.4 plan). These mix ONLY held-out energies with
+    generic neutral families, so they probe wide-spectrum extrapolation without
+    touching the deployment spectrum. Returns None when no held-out energy is
+    available.
+    """
+    heldout_set = set(heldout)
+    held_idx = [i for i, e in enumerate(energies_MeV) if e in heldout_set]
+    if not held_idx:
+        return None
+
+    if dirichlet_alpha_choices is None:
+        dirichlet_alpha_choices = list(cfg.synth.get("dirichlet_alpha_choices", [0.3, 1.0, 3.0]))
+
+    return SynthGenerator(
+        mono_A[held_idx],
+        mono_B[held_idx],
+        np.array([energies_MeV[i] for i in held_idx]),
+        families=families,
+        poisson_noise=cfg.synth.poisson_noise,
+        dirichlet_alpha_choices=dirichlet_alpha_choices,
+        sparse_k_range=tuple(cfg.synth.get("sparse_k_range", [2, 4])),
+        poisson_counts_range=tuple(cfg.synth.get("poisson_counts_range", [1000, 100000])),
+        powerlaw_alpha_range=tuple(cfg.synth.get("powerlaw_alpha_range", [-3.0, 0.0])),
+    )
+
+
+@torch.no_grad()
+def eval_emd(model, loader, criterion, device, use_amp) -> float:
+    """Mean EMD of the model over a loader (in the training/target space)."""
+    model.eval()
+    emds = []
+    for batch in loader:
+        x = batch["input"].to(device)
+        y = batch["target"].to(device)
+        with torch.amp.autocast("cuda", enabled=use_amp):
+            pred = model(x)
+            _, loss_dict = criterion(pred, y)
+        emds.append(loss_dict["emd"].item())
+    return float(np.mean(emds)) if emds else float("nan")
+
+
+@torch.no_grad()
+def eval_peak_error(model, loader, device, use_amp) -> float:
+    """Mean |argmax(pred) - argmax(target)| in bins.
+
+    argmax is invariant to the monotonic log-compression, so this is valid for
+    both normalized (density) and non-normalized (log-compressed) targets.
+    """
+    model.eval()
+    errs = []
+    for batch in loader:
+        x = batch["input"].to(device)
+        y = batch["target"].to(device)
+        with torch.amp.autocast("cuda", enabled=use_amp):
+            pred = model(x)
+        p = pred.squeeze(1).float().argmax(dim=-1)
+        t = y.squeeze(1).float().argmax(dim=-1)
+        errs.append(torch.abs(p - t).float().mean().item())
+    return float(np.mean(errs)) if errs else float("nan")
+
+
 def train(cfg, fast_dev_run: bool = False) -> None:
     set_seed(cfg.seed)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -177,9 +250,45 @@ def train(cfg, fast_dev_run: bool = False) -> None:
         val_gen, input_pre, target_pre, n_samples=test_n, seed=cfg.seed + 2
     )
 
+    # --- Wide-spectrum & extreme-extrapolation validation sets (v0.4 Sec.3) ---
+    # These mix ONLY held-out energies with generic neutral families. They probe
+    # wide-spectrum extrapolation -- closer to the deployment scenario than the
+    # mono/interpolation val set -- without ever touching the deployment file.
+    wide_families = list(cfg.eval.get(
+        "wide_families", ["dirichlet_uniform", "loguniform", "powerlaw_neutral"]
+    ))
+    extreme_families = list(cfg.eval.get(
+        "extreme_families", ["dirichlet_uniform", "powerlaw_neutral"]
+    ))
+    extreme_alphas = list(cfg.eval.get("extreme_dirichlet_alpha_choices", [0.05, 50.0]))
+
+    wide_gen = build_heldout_generator(
+        mono_A, mono_B, energies_MeV, heldout, cfg, families=wide_families
+    )
+    extreme_gen = build_heldout_generator(
+        mono_A, mono_B, energies_MeV, heldout, cfg,
+        families=extreme_families, dirichlet_alpha_choices=extreme_alphas,
+    )
+    mono_held_gen = build_heldout_generator(
+        mono_A, mono_B, energies_MeV, heldout, cfg, families=["mono"]
+    )
+
+    wide_val_ds = FixedMixtureSet(
+        wide_gen or val_gen, input_pre, target_pre, n_samples=val_n, seed=cfg.seed + 10
+    )
+    extreme_val_ds = FixedMixtureSet(
+        extreme_gen or val_gen, input_pre, target_pre, n_samples=val_n, seed=cfg.seed + 11
+    )
+    mono_held_ds = FixedMixtureSet(
+        mono_held_gen or val_gen, input_pre, target_pre, n_samples=val_n, seed=cfg.seed + 12
+    )
+
     batch_size = min(cfg.train.batch_size, samples_per_epoch)
     train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True, num_workers=0)
     val_loader = DataLoader(val_ds, batch_size=batch_size, shuffle=False, num_workers=0)
+    wide_loader = DataLoader(wide_val_ds, batch_size=batch_size, shuffle=False, num_workers=0)
+    extreme_loader = DataLoader(extreme_val_ds, batch_size=batch_size, shuffle=False, num_workers=0)
+    mono_held_loader = DataLoader(mono_held_ds, batch_size=batch_size, shuffle=False, num_workers=0)
 
     # Model
     model = UNet1D(
@@ -197,8 +306,17 @@ def train(cfg, fast_dev_run: bool = False) -> None:
     emd_space = cfg.loss.get("emd_space", "index")
     bin_dist = make_bin_dist(energy_grid, emd_space)
 
-    # Loss
-    criterion = SpectrumLoss(w_mse=cfg.loss.w_mse, w_emd=cfg.loss.w_emd, bin_dist=bin_dist)
+    # Loss. The mass term is only active for non-normalized heads (w_mass>0);
+    # decode out of log space using the configured log_scale so the constraint
+    # is on the integrated density.
+    head = cfg.model.head
+    w_mass = float(cfg.loss.get("w_mass", 0.0))
+    target_is_log = head not in ("softmax", "softplus_renorm")
+    mass_log_scale = float(cfg.preprocessing.log_scale) if target_is_log else None
+    criterion = SpectrumLoss(
+        w_mse=cfg.loss.w_mse, w_emd=cfg.loss.w_emd, bin_dist=bin_dist,
+        w_mass=w_mass, log_scale=mass_log_scale,
+    )
 
     # Optimizer
     optimizer = torch.optim.AdamW(
@@ -225,9 +343,15 @@ def train(cfg, fast_dev_run: bool = False) -> None:
 
     best_val_loss = float("inf")
     best_val_emd = float("inf")
+    best_select = float("inf")
 
     early_stop_metric = cfg.train.get("early_stop_metric", "val_emd")
     early_stop_patience = cfg.train.get("early_stop_patience", 50)
+    # composite_wide = w_emd * wide_val_emd + w_peak * heldout_mono_peak_error.
+    # Constrains overall wide-spectrum shape while guarding the peak position
+    # (which EMD alone let regress in v0.2). No deployment-spectrum info is used.
+    composite_w_emd = float(cfg.train.get("composite_w_emd", 1.0))
+    composite_w_peak = float(cfg.train.get("composite_w_peak", 0.1))
     patience_counter = 0
 
     for epoch in range(epochs):
@@ -279,16 +403,31 @@ def train(cfg, fast_dev_run: bool = False) -> None:
         avg_val_emd = np.mean(val_emds)
         lr = scheduler.get_last_lr()[0]
 
+        # Wide-spectrum / extreme / peak metrics (heldout-only selection signals)
+        wide_emd = eval_emd(model, wide_loader, criterion, device, use_amp)
+        extreme_emd = eval_emd(model, extreme_loader, criterion, device, use_amp)
+        peak_err = eval_peak_error(model, mono_held_loader, device, use_amp)
+        composite = composite_w_emd * wide_emd + composite_w_peak * peak_err
+
+        # Selection metric: composite_wide is the v0.4 default; val_emd kept for
+        # backward compatibility / ablation.
+        select = composite if early_stop_metric == "composite_wide" else avg_val_emd
+
         writer.add_scalar("Loss/train", avg_train, epoch)
         writer.add_scalar("Loss/val", avg_val, epoch)
         writer.add_scalar("EMD/val", avg_val_emd, epoch)
+        writer.add_scalar("EMD/wide", wide_emd, epoch)
+        writer.add_scalar("EMD/extreme", extreme_emd, epoch)
+        writer.add_scalar("PeakErr/heldout_mono", peak_err, epoch)
+        writer.add_scalar("Composite/wide", composite, epoch)
         writer.add_scalar("LR", lr, epoch)
 
         if (epoch + 1) % 10 == 0 or epoch == 0:
             print(
                 f"Epoch {epoch+1:4d}/{epochs} | "
-                f"train={avg_train:.4f} val={avg_val:.4f} "
-                f"val_emd={avg_val_emd:.4f} lr={lr:.2e}"
+                f"train={avg_train:.4f} val={avg_val:.4f} val_emd={avg_val_emd:.4f} | "
+                f"wide={wide_emd:.4f} extreme={extreme_emd:.4f} peak={peak_err:.2f} "
+                f"composite={composite:.4f} lr={lr:.2e}"
             )
 
         # Checkpoint
@@ -298,29 +437,36 @@ def train(cfg, fast_dev_run: bool = False) -> None:
             "optimizer": optimizer.state_dict(),
             "val_loss": avg_val,
             "val_emd": avg_val_emd,
+            "wide_emd": wide_emd,
+            "extreme_emd": extreme_emd,
+            "heldout_peak_error": peak_err,
+            "composite_wide": composite,
             "cfg": OmegaConf.to_container(cfg),
         }
         torch.save(state, str(ckpt_dir / "last.pt"))
 
-        if avg_val < best_val_loss:
-            best_val_loss = avg_val
-            torch.save(state, str(ckpt_dir / "best.pt"))
-
-        # Early stopping on val_emd
         if avg_val_emd < best_val_emd:
             best_val_emd = avg_val_emd
+        if avg_val < best_val_loss:
+            best_val_loss = avg_val
+
+        # Best checkpoint + early stopping on the selected metric
+        if select < best_select:
+            best_select = select
             patience_counter = 0
+            torch.save(state, str(ckpt_dir / "best.pt"))
         else:
             patience_counter += 1
             if not fast_dev_run and patience_counter >= early_stop_patience:
                 print(
                     f"Early stopping at epoch {epoch+1}: "
-                    f"val_emd={avg_val_emd:.4f} (patience={early_stop_patience})"
+                    f"{early_stop_metric}={select:.4f} (patience={early_stop_patience})"
                 )
                 break
 
     writer.close()
-    print(f"Training done. Best val loss: {best_val_loss:.4f}, best val EMD: {best_val_emd:.4f}")
+    print(f"Training done. Best {early_stop_metric}: {best_select:.4f} "
+          f"(val_loss={best_val_loss:.4f}, val_emd={best_val_emd:.4f})")
     print(f"Checkpoints: {ckpt_dir}/best.pt, {ckpt_dir}/last.pt")
     print(f"TensorBoard logs: {run_dir}")
 

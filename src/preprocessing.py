@@ -76,12 +76,25 @@ class Preprocessor:
         return y.astype(np.float64)
 
 
+# Heads whose output is a normalized density (sum=1). Their target must be a
+# plain density. Non-normalized heads (everything else) require a log-compressed
+# target so prediction and target share the same numeric space. This pairing is
+# the mirror of the v0.1 fatal bug and is locked by
+# tests/test_leakage.py::test_preprocessor_head_match.
+NORMALIZED_HEADS = ("softmax", "softplus_renorm")
+
+
 def build_preprocessors(cfg) -> tuple["Preprocessor", "Preprocessor"]:
     """Build the (input, target) preprocessor pair from a config.
 
-    The model's softmax head emits a normalized density, so the TARGET must be a
-    plain normalized density (never log-compressed). Log-compression, when
-    enabled, is applied only to the INPUT as a representation aid.
+    The INPUT is always log-compressed (when enabled) as a representation aid for
+    the 6-decade dynamic range. The TARGET space depends on the model head:
+
+    - normalized head (softmax, softplus_renorm): target is a plain density,
+      never log-compressed (the head cannot reach a log-compressed magnitude).
+    - non-normalized head (softplus, relu): target IS log-compressed, so the head
+      (which can emit true zeros) shares the target's space and the near-zero
+      tail is learnable.
 
     Returns
     -------
@@ -92,12 +105,7 @@ def build_preprocessors(cfg) -> tuple["Preprocessor", "Preprocessor"]:
     log_compress_input = bool(cfg.preprocessing.log_compress)
 
     head = getattr(cfg.model, "head", "softmax")
-    # softmax / softplus_renorm heads emit a normalized density, so the target
-    # must be a plain density. Only a raw head could match a log-compressed
-    # target.
-    target_log = (
-        log_compress_input if head not in ("softmax", "softplus_renorm") else False
-    )
+    target_log = log_compress_input if head not in NORMALIZED_HEADS else False
 
     input_pre = Preprocessor(
         normalize=normalize, log_compress=log_compress_input, log_scale=log_scale

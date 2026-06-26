@@ -1,0 +1,65 @@
+seed: 42
+data:
+  raw_glob: "data/raw/*MeV.xlsx"
+  gcr_file: "data/deploy/GCR_spectrum.xlsx"   # deployment spectrum; origin unknown
+  sheet_skiprows: 1
+  direction: "SiC_SBD->TEPC"
+  # 13 energies total: 90/100/200/300/400/500/600/800/1000/2000/4000/7000/10000.
+  # Heldout spans low/mid/high to cover different interpolation difficulties.
+  # Frozen BEFORE any deployment-spectrum evaluation (v0.4 plan Sec 1.3).
+  heldout_energies_MeV: [100, 600, 2000, 7000]
+
+preprocessing:
+  normalize_to_density: true
+  log_compress: true
+  log_scale: 1.0e4
+
+synth:
+  # All families are generic/neutral; none is templated on an observed target.
+  mixture_families: [mono, sparse_k, dirichlet_uniform, loguniform, powerlaw_neutral]
+  powerlaw_alpha_range: [-3.0, 0.0]   # generic random exponent, NOT a physical GCR index
+  dirichlet_alpha_choices: [0.1, 0.3, 1.0, 3.0]
+  sparse_k_range: [2, 8]
+  poisson_noise: true
+  poisson_counts_range: [1000, 100000]
+
+model:
+  arch: unet1d
+  in_ch: 1
+  base_channels: 32        # back to small model (v0.3's 10M overfit 8 energies)
+  depth: 3
+  norm: group
+  activation: gelu
+  head: softplus           # NON-normalized head: can emit true zeros (kills the
+                           # ~1e-4 high-energy plateau of normalized heads)
+
+loss:
+  w_mse: 0.5
+  w_emd: 2.0
+  w_mass: 1.0              # mass-conservation term (active for non-normalized head)
+  emd_space: index         # index gives the best peak position; log_energy = ablation
+
+train:
+  samples_per_epoch: 2048
+  val_mixtures: 256
+  test_mixtures: 256
+  epochs: 600
+  early_stop_metric: composite_wide   # wide_val_emd + peak_err (no GCR)
+  composite_w_emd: 1.0
+  composite_w_peak: 0.1
+  early_stop_patience: 80
+  batch_size: 64
+  optimizer: adamw
+  lr: 2.0e-4
+  weight_decay: 1.0e-4
+  scheduler: cosine
+  grad_clip: 1.0
+  amp: true
+
+eval:
+  tail_percentile: 90
+  # Wide-spectrum validation: held-out energies mixed with broad neutral families.
+  wide_families: [dirichlet_uniform, loguniform, powerlaw_neutral]
+  # Extreme-extrapolation subset: very sparse (alpha=0.05) and near-uniform (alpha=50).
+  extreme_families: [dirichlet_uniform, powerlaw_neutral]
+  extreme_dirichlet_alpha_choices: [0.05, 50.0]
