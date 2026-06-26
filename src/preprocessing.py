@@ -74,3 +74,35 @@ class Preprocessor:
             y = y * total_counts
 
         return y.astype(np.float64)
+
+
+def build_preprocessors(cfg) -> tuple["Preprocessor", "Preprocessor"]:
+    """Build the (input, target) preprocessor pair from a config.
+
+    The model's softmax head emits a normalized density, so the TARGET must be a
+    plain normalized density (never log-compressed). Log-compression, when
+    enabled, is applied only to the INPUT as a representation aid.
+
+    Returns
+    -------
+    (input_pre, target_pre)
+    """
+    normalize = cfg.preprocessing.normalize_to_density
+    log_scale = cfg.preprocessing.log_scale
+    log_compress_input = bool(cfg.preprocessing.log_compress)
+
+    head = getattr(cfg.model, "head", "softmax")
+    # softmax / softplus_renorm heads emit a normalized density, so the target
+    # must be a plain density. Only a raw head could match a log-compressed
+    # target.
+    target_log = (
+        log_compress_input if head not in ("softmax", "softplus_renorm") else False
+    )
+
+    input_pre = Preprocessor(
+        normalize=normalize, log_compress=log_compress_input, log_scale=log_scale
+    )
+    target_pre = Preprocessor(
+        normalize=normalize, log_compress=target_log, log_scale=log_scale
+    )
+    return input_pre, target_pre

@@ -18,7 +18,7 @@ from src.dataset import FixedMixtureSet
 from src.evaluate import evaluate_on_set
 from src.model import UNet1D
 from src.plots import plot_cdf_comparison, plot_spectrum_comparison
-from src.preprocessing import Preprocessor
+from src.preprocessing import Preprocessor, build_preprocessors
 from src.synth import SynthGenerator
 
 
@@ -68,14 +68,11 @@ def main() -> None:
         gcr_powerlaw_index=cfg.synth.gcr_powerlaw_index,
     )
 
-    preprocessor = Preprocessor(
-        normalize=cfg.preprocessing.normalize_to_density,
-        log_compress=cfg.preprocessing.log_compress,
-        log_scale=cfg.preprocessing.log_scale,
-    )
+    input_pre, target_pre = build_preprocessors(cfg)
 
     test_ds = FixedMixtureSet(
-        test_gen, preprocessor, n_samples=cfg.train.test_mixtures, seed=cfg.seed + 2
+        test_gen, input_pre, target_pre,
+        n_samples=cfg.train.test_mixtures, seed=cfg.seed + 2,
     )
 
     # Load model
@@ -90,7 +87,7 @@ def main() -> None:
     model.load_state_dict(ckpt["model"])
     model.eval()
 
-    metrics = evaluate_on_set(model, test_ds, preprocessor, energy_grid, cfg)
+    metrics = evaluate_on_set(model, test_ds, target_pre, energy_grid, cfg)
     print("Test metrics:")
     for k, v in metrics.items():
         print(f"  {k}: {v:.6f}")

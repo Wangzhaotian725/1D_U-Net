@@ -90,13 +90,12 @@ def test_sample_weights_dense():
     assert (w >= 0).all()
 
 
-def test_sample_weights_gcr_like():
-    """gcr_like weights are non-negative and not all zero."""
+def test_sample_weights_gcr_like_removed():
+    """gcr_like family has been removed and should raise ValueError."""
     energies = np.array([200.0, 400.0, 800.0, 1600.0, 3200.0])
     rng = np.random.default_rng(4)
-    w = sample_weights(len(energies), "gcr_like", rng, energies_MeV=energies)
-    assert (w >= 0).all()
-    assert w.sum() > 0
+    with pytest.raises(ValueError, match="gcr_like"):
+        sample_weights(len(energies), "gcr_like", rng, energies_MeV=energies)
 
 
 def test_synth_generator_output_shape():

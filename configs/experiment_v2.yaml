@@ -7,14 +7,14 @@ data:
   heldout_energies_MeV: [600, 2000, 7000]
 preprocessing:
   normalize_to_density: true
-  log_compress: true        # applies to the network INPUT only; the target stays
-                            # a plain normalized density to match the softmax head
+  log_compress: true
   log_scale: 1.0e4
 synth:
-  weight_prior: dirichlet
-  gcr_powerlaw_index: -2.7
-  mixture_families: [mono, sparse, dense, gcr_like]
+  mixture_families: [mono, sparse_k, dirichlet_uniform, loguniform]
+  dirichlet_alpha_choices: [0.3, 1.0, 3.0]
+  sparse_k_range: [2, 4]
   poisson_noise: true
+  poisson_counts_range: [1000, 100000]
 model:
   arch: unet1d
   in_ch: 1
@@ -22,16 +22,18 @@ model:
   depth: 3
   norm: group
   activation: gelu
-  head: softmax
+  head: softplus_renorm
 loss:
-  w_mse: 1.0
-  w_emd: 1.0
-  emd_space: index
+  w_mse: 0.5
+  w_emd: 2.0
+  emd_space: log_energy
 train:
   samples_per_epoch: 1024
   val_mixtures: 256
   test_mixtures: 256
-  epochs: 300
+  epochs: 500
+  early_stop_metric: val_emd
+  early_stop_patience: 50
   batch_size: 64
   optimizer: adamw
   lr: 3.0e-4
