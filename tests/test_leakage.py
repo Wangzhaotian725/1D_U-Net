@@ -96,9 +96,9 @@ def test_heldout_disjoint():
     """Training and heldout energy sets must be disjoint (13-energy set)."""
     from src.synth import SynthGenerator
 
-    all_energies = [90, 100, 200, 300, 400, 500, 600, 800, 1000, 2000, 4000, 7000, 10000]
+    all_energies = [90, 100, 200, 300, 400, 500, 600, 800, 1000, 2000, 4000, 5000, 6000, 7000, 8000, 10000]
     heldout = [100, 600, 2000, 7000]
-    assert len(all_energies) == 13
+    assert len(all_energies) == 16
 
     heldout_set = set(heldout)
     train_energies = [e for e in all_energies if e not in heldout_set]
