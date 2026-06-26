@@ -6,6 +6,59 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
+def build_model(cfg) -> nn.Module:
+    """Factory: instantiate the right architecture from cfg.model.arch.
+
+    Supported values for cfg.model.arch:
+        'unet1d'        → UNet1D (baseline)
+        'unet_attn'     → AttnUNet1D (attention-gated skip connections)
+        'operator'      → TransferOperator (low-rank band-limited)
+        'transformer1d' → SpectrumTransformer (no skip connections)
+    """
+    arch = str(cfg.model.get("arch", "unet1d")).lower()
+
+    if arch == "unet1d":
+        return UNet1D(
+            in_ch=cfg.model.in_ch,
+            out_ch=1,
+            base=cfg.model.base_channels,
+            depth=cfg.model.depth,
+            head=cfg.model.head,
+        )
+    elif arch == "unet_attn":
+        from src.models.unet_attn import AttnUNet1D
+        skip_gate_scale = list(cfg.model.get("skip_gate_scale", [1.0] * cfg.model.depth))
+        return AttnUNet1D(
+            in_ch=cfg.model.in_ch,
+            out_ch=1,
+            base=cfg.model.base_channels,
+            depth=cfg.model.depth,
+            head=cfg.model.head,
+            skip_gate_scale=skip_gate_scale,
+        )
+    elif arch == "operator":
+        from src.models.operator import TransferOperator
+        return TransferOperator(
+            n_bins=int(cfg.model.get("n_bins", 360)),
+            rank=int(cfg.model.get("operator_rank", 24)),
+            band_halfwidth=cfg.model.get("operator_band_halfwidth", 60),
+            head=cfg.model.head,
+        )
+    elif arch == "transformer1d":
+        from src.models.transformer1d import SpectrumTransformer
+        return SpectrumTransformer(
+            n_bins=int(cfg.model.get("n_bins", 360)),
+            d_model=int(cfg.model.get("d_model", 128)),
+            n_layers=int(cfg.model.get("n_layers", 4)),
+            n_heads=int(cfg.model.get("n_heads", 8)),
+            dim_feedforward=int(cfg.model.get("dim_feedforward", 512)),
+            dropout=float(cfg.model.get("dropout", 0.0)),
+            head=cfg.model.head,
+        )
+    else:
+        raise ValueError(f"Unknown arch: {arch!r}. Choose from unet1d, unet_attn, operator, transformer1d")
+
+
 def _pad_or_crop(x: torch.Tensor, target_len: int) -> torch.Tensor:
     """Pad or crop the last dimension of x to target_len."""
     if x.shape[-1] > target_len:

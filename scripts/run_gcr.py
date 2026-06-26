@@ -15,7 +15,7 @@ from omegaconf import OmegaConf
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from src.evaluate import evaluate_gcr
-from src.model import UNet1D
+from src.model import UNet1D, build_model
 from src.plots import plot_cdf_comparison, plot_spectrum_comparison
 from src.preprocessing import Preprocessor, build_preprocessors
 
@@ -64,18 +64,22 @@ def main() -> None:
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    # Load canonical grid
-    energy_grid = np.load("data/processed/energy_grid.npy")
+    # Load canonical grid (rebuild from raw files if cache is missing)
+    grid_path = Path("data/processed/energy_grid.npy")
+    if grid_path.exists():
+        energy_grid = np.load(str(grid_path))
+    else:
+        import glob
+        from src.data import load_spectrum_file
+        files = sorted(glob.glob(cfg.data.raw_glob))
+        if not files:
+            raise FileNotFoundError(f"No raw files found matching {cfg.data.raw_glob}")
+        spec = load_spectrum_file(files[0], skiprows=cfg.data.sheet_skiprows)
+        energy_grid = spec["energy"]
 
     # Load model
     ckpt = torch.load(args.ckpt, map_location="cpu", weights_only=False)
-    model = UNet1D(
-        in_ch=cfg.model.in_ch,
-        out_ch=1,
-        base=cfg.model.base_channels,
-        depth=cfg.model.depth,
-        head=cfg.model.head,
-    )
+    model = build_model(cfg)
     model.load_state_dict(ckpt["model"])
     model.eval()
 

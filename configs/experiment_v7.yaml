@@ -1,0 +1,67 @@
+seed: 42
+data:
+  raw_glob: "data/raw/*MeV.xlsx"
+  gcr_file: "data/deploy/GCR_spectrum.xlsx"   # 部署谱；来源与物理成因视为"未知"
+  sheet_skiprows: 1
+  direction: "SiC_SBD->TEPC"
+  # 16个能量点，heldout从v0.4起固定不变
+  heldout_energies_MeV: [100, 600, 2000, 7000]
+
+preprocessing:
+  normalize_to_density: true
+  log_compress: true
+  log_scale: 1.0e4
+
+synth:
+  mixture_families: [mono, sparse_k, dirichlet_uniform, loguniform, powerlaw_neutral]
+  powerlaw_alpha_range: [-3.0, 0.0]
+  dirichlet_alpha_choices: [0.1, 0.3, 1.0, 3.0]
+  sparse_k_range: [2, 8]
+  poisson_noise: true
+  poisson_counts_range: [1000, 100000]
+
+model:
+  arch: unet_attn           # 保留skip连接，但用注意力门控抑制峰位泄漏
+  in_ch: 1
+  base_channels: 32
+  depth: 3
+  head: softplus_renorm
+  # 所有三级skip均启用注意力门（scale=1.0）
+  # 如需消融最浅一级：skip_gate_scale: [0.0, 1.0, 1.0]
+  skip_gate_scale: [1.0, 1.0, 1.0]
+
+loss:
+  w_emd: 2.0
+  w_peak: 3.0          # 较v0.5(2.0)增强，加强峰位对准
+  peak_window_half: 30
+  w_mse: 0.5
+  w_unimodal: 2.0      # 较v0.6(0.5)提高4倍，强力惩罚双峰输出
+  region_kev: [0.1, 1000.0]
+  region_in_weight: 1.0
+  region_out_weight: 0.1
+  emd_space: index
+
+train:
+  samples_per_epoch: 2048
+  val_mixtures: 256
+  test_mixtures: 256
+  epochs: 600
+  # selection_score (v0.7) = peak_err + 0.3*region_emd + 1.0*secondary_peak_ratio
+  # SPR权重从0.5提高到1.0，使其与peak_err等权，更强调消除双峰
+  early_stop_metric: selection_score
+  lambda_region: 0.3
+  lambda_secondary_peak_ratio: 1.0
+  early_stop_patience: 80
+  batch_size: 64
+  optimizer: adamw
+  lr: 2.0e-4
+  weight_decay: 1.0e-4
+  scheduler: cosine
+  grad_clip: 1.0
+  amp: true
+
+eval:
+  tail_percentile: 90
+  wide_families: [dirichlet_uniform, loguniform, powerlaw_neutral]
+  extreme_families: [dirichlet_uniform, powerlaw_neutral]
+  extreme_dirichlet_alpha_choices: [0.05, 50.0]
