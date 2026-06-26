@@ -23,7 +23,7 @@ synth:
   poisson_counts_range: [1000, 100000]
 
 model:
-  arch: operator          # Direction A: transfer operator (no skip connections)
+  arch: transformer1d     # Direction B: Transformer encoder (no skip connections)
   in_ch: 1
   n_bins: 360
   head: softplus_renorm
